@@ -1027,12 +1027,14 @@ function getConfig() {
 function ensureOwner() {
   const exists = db.prepare("SELECT id FROM users WHERE role = 'OWNER' LIMIT 1").get();
   if (exists) return null;
-  const email = 'owner@nebulous.local';
-  const password = 'Owner!2026';
+  const email = String(process.env.OWNER_EMAIL || 'owner@nebulous.local').trim().toLowerCase();
+  const password = String(process.env.OWNER_PASSWORD || 'Owner!2026');
+  const firstName = String(process.env.OWNER_FIRST_NAME || 'Owner').trim().slice(0, 80) || 'Owner';
+  const lastName = String(process.env.OWNER_LAST_NAME || 'Nebulous').trim().slice(0, 80) || 'Nebulous';
   const hash = bcrypt.hashSync(password, 10);
   db.prepare(`INSERT INTO users(email, password_hash, first_name, last_name, role, status, email_verified)
               VALUES(?, ?, ?, ?, 'OWNER', 'ACTIVE', 1)`)
-    .run(email, hash, 'Owner', 'Nebulous');
+    .run(email, hash, firstName, lastName);
   return { email, password };
 }
 

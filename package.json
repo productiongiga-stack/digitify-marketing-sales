@@ -5,7 +5,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "seed:owner": "node scripts/seed-owner-sqlite.js"
   },
   "dependencies": {
     "archiver": "^7.0.1",
