@@ -698,7 +698,7 @@ async function ensureInvoiceForOrder(orderId, config) {
   if (!Number.isInteger(id) || id <= 0) return null;
   const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
   if (!order) return null;
-  let inv = getInvoiceByOrderId(id);
+  let inv = await getInvoiceByOrderId(id);
   if (inv) return inv;
   const now = new Date();
   const dueIso = computeInvoiceDueDateIso(now, config?.documents?.invoice?.paymentTermsDays);
@@ -722,7 +722,7 @@ async function ensureInvoiceForOrder(orderId, config) {
     await db.prepare(`UPDATE invoices SET finalized_at = COALESCE(finalized_at, ?) WHERE order_id = ?`)
       .run(now.toISOString(), id);
   }
-  return getInvoiceByOrderId(id);
+  return await getInvoiceByOrderId(id);
 }
 
 async function backfillMissingInvoices(config, limit = 300) {
@@ -735,7 +735,7 @@ async function backfillMissingInvoices(config, limit = 300) {
     ORDER BY o.id DESC
     LIMIT ?
   `).all(Math.max(1, Number(limit) || 300));
-  rows.forEach((r) => ensureInvoiceForOrder(r.id, config));
+  for (const r of rows) await ensureInvoiceForOrder(r.id, config);
   return rows.length;
 }
 
@@ -753,7 +753,7 @@ async function finalizeInvoiceForOrder(orderId, config) {
               SET invoice_number = ?, status = 'DEFINITIVE', issue_date = ?, due_date = ?, finalized_at = ?, metadata = ?
               WHERE order_id = ? AND status != 'PAID'`)
     .run(invoiceNo, now.toISOString(), dueIso, now.toISOString(), JSON.stringify({ source: 'order_approved' }), id);
-  return getInvoiceByOrderId(id);
+  return await getInvoiceByOrderId(id);
 }
 
 async function markInvoicePaid(orderId) {
@@ -1833,7 +1833,7 @@ async function generatePackingSlipPdfBuffer(orderData, config) {
 }
 
 async function buildInvoiceAttachmentForOrder(orderId) {
-  const data = collectOrderDocumentData(orderId);
+  const data = await collectOrderDocumentData(orderId);
   if (!data) return null;
   const cfg = await getConfig();
   const pdf = await generateInvoicePdfBuffer(data, cfg);
@@ -2011,7 +2011,8 @@ async function buildOrderEmailPreview(orderId, type, opts = {}) {
   const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
   if (!order) throw new Error('Order niet gevonden');
   if (isOrderArchived(order)) throw new Error('Order is gearchiveerd. Zet eerst terug.');
-  const invoice = ensureInvoiceForOrder(id, cfg) || getInvoiceByOrderId(id);
+  let invoice = await ensureInvoiceForOrder(id, cfg);
+  if (!invoice) invoice = await getInvoiceByOrderId(id);
   const payment = await db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id DESC LIMIT 1').get(id) || null;
   const depositInvoice = await getLatestDepositInvoiceByOrderId(id);
   const customerName = `${order.customer_first || ''} ${order.customer_last || ''}`.trim();
@@ -2080,9 +2081,11 @@ async function sendPaymentLinkEmailWithInvoice(order, payment = null, opts = {})
   if (!order?.customer_email) return { skipped: 'no_recipient' };
   const cfg = opts.config || await getConfig();
   const includeInvoice = opts.includeInvoice !== false;
-  let invoice = ensureInvoiceForOrder(order.id, cfg) || getInvoiceByOrderId(order.id);
+  let invoice = await ensureInvoiceForOrder(order.id, cfg);
+  if (!invoice) invoice = await getInvoiceByOrderId(order.id);
   if (!invoice || invoice.status === 'CONCEPT') {
-    invoice = finalizeInvoiceForOrder(order.id, cfg) || getInvoiceByOrderId(order.id);
+    invoice = await finalizeInvoiceForOrder(order.id, cfg);
+    if (!invoice) invoice = await getInvoiceByOrderId(order.id);
   }
   const attachment = includeInvoice ? await buildInvoiceAttachmentForOrder(order.id) : null;
   const paymentUrl = payment?.checkoutUrl
@@ -2498,7 +2501,7 @@ app.get('/api/me/export-data', requireAuth, async (req, res) => {
     appendJson('cart/cart-designs.json', exportData.cartDesigns);
     appendJson('uploads/files-manifest.json', exportData.uploadFiles);
 
-    logAuditFromReq(req, {
+    await logAuditFromReq(req, {
       action: 'GDPR_DATA_EXPORTED',
       entityType: 'user',
       entityId: req.user.id,
@@ -2599,7 +2602,7 @@ app.post('/api/me/2fa/enable', requireAuth, async (req, res) => {
   req.session.pendingTotpSecret = null;
   req.session.force2faSetup = false;
 
-  logAuditFromReq(req, {
+  await logAuditFromReq(req, {
     action: 'USER_2FA_ENABLED',
     entityType: 'user',
     entityId: req.user.id,
@@ -2637,7 +2640,7 @@ app.post('/api/me/2fa/disable', requireAuth, async (req, res) => {
   req.session.pendingTotpSecret = null;
   req.session.force2faSetup = false;
 
-  logAuditFromReq(req, {
+  await logAuditFromReq(req, {
     action: 'USER_2FA_DISABLED',
     entityType: 'user',
     entityId: req.user.id,
@@ -2659,7 +2662,7 @@ async function loadCart(userId) {
 }
 
 app.get('/api/cart', requireAuth, async (req, res) => {
-  res.json({ items: loadCart(req.user.id) });
+  res.json({ items: await loadCart(req.user.id) });
 });
 
 app.post('/api/cart', requireAuth, cartUpload.fields([
@@ -2836,7 +2839,7 @@ app.post('/api/orders', requireAuth, async (req, res) => {
       code: 'EMAIL_NOT_VERIFIED'
     });
   }
-  const cart = loadCart(req.user.id);
+  const cart = await loadCart(req.user.id);
   if (!cart.length) return res.status(400).json({ error: 'Winkelmand is leeg' });
   const { customer = {}, notes, saveAddress } = req.body || {};
   const required = ['firstName', 'lastName', 'email', 'address', 'postcode', 'city'];
@@ -3048,7 +3051,7 @@ app.put('/api/orders/:id/cancel', requireAuth, async (req, res) => {
   await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('CANCELLED', id);
   await db.prepare(`INSERT INTO order_status_history(order_id, status, note, changed_by)
               VALUES(?, 'CANCELLED', 'Geannuleerd door klant', ?)`).run(id, req.user.id);
-  markInvoiceVoid(id);
+  await markInvoiceVoid(id);
   res.json({ ok: true });
 });
 
@@ -3297,7 +3300,7 @@ app.post('/api/admin/invoices/remind-bulk', requireAuth, requireRole('ADMIN', 'O
     const missing = ids.filter(i => !foundSet.has(i));
     skipped += missing.length;
 
-    logAuditFromReq(req, {
+    await logAuditFromReq(req, {
       action: 'INVOICE_REMINDER_BULK_SENT',
       entityType: 'invoice',
       entityId: null,
@@ -3360,11 +3363,11 @@ app.put('/api/admin/orders/:id/status', requireAuth, requireRole('ADMIN', 'OWNER
   await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run(status, id);
   await db.prepare(`INSERT INTO order_status_history(order_id, status, note, changed_by)
               VALUES(?, ?, ?, ?)`).run(id, status, note, req.user.id);
-  if (status === 'PAID') markInvoicePaid(id);
-  else if (status === 'CANCELLED') markInvoiceVoid(id);
-  else if (status === 'APPROVED_AWAITING_PAYMENT' || status === 'PAYMENT_PENDING') finalizeInvoiceForOrder(id, await getConfig());
+  if (status === 'PAID') await markInvoicePaid(id);
+  else if (status === 'CANCELLED') await markInvoiceVoid(id);
+  else if (status === 'APPROVED_AWAITING_PAYMENT' || status === 'PAYMENT_PENDING') await finalizeInvoiceForOrder(id, await getConfig());
 
-  logAuditFromReq(req, {
+  await logAuditFromReq(req, {
     action: 'ORDER_STATUS_UPDATED',
     entityType: 'order',
     entityId: id,
@@ -3409,7 +3412,7 @@ app.put('/api/admin/orders/:id/customer', requireAuth, requireRole('ADMIN', 'OWN
     clean(b.address), clean(b.postcode, 20), clean(b.city), clean(b.phone, 40),
     id
   );
-  logAuditFromReq(req, { action: 'ORDER_STATUS_UPDATED', entityType: 'order', entityId: id, summary: `Klantgegevens order #${id} bijgewerkt` });
+  await logAuditFromReq(req, { action: 'ORDER_STATUS_UPDATED', entityType: 'order', entityId: id, summary: `Klantgegevens order #${id} bijgewerkt` });
   res.json({ ok: true });
 });
 
@@ -3426,7 +3429,7 @@ async function handleSoftDeleteOrder(req, res) {
               WHERE id = ?`)
     .run(new Date().toISOString(), req.user.id, reason, id);
 
-  logAuditFromReq(req, {
+  await logAuditFromReq(req, {
     action: 'ORDER_SOFT_DELETED',
     entityType: 'order',
     entityId: id,
@@ -3525,7 +3528,7 @@ app.put('/api/admin/orders/bulk-status', requireAuth, requireRole('ADMIN', 'OWNE
     }
   }
 
-  logAuditFromReq(req, {
+  await logAuditFromReq(req, {
     action: 'ORDER_BULK_STATUS_UPDATED',
     entityType: 'order',
     entityId: null,
@@ -3572,7 +3575,7 @@ async function handleBulkSoftDeleteOrders(req, res) {
     updated++;
   }
 
-  logAuditFromReq(req, {
+  await logAuditFromReq(req, {
     action: 'ORDER_BULK_SOFT_DELETED',
     entityType: 'order',
     entityId: null,
@@ -3595,7 +3598,7 @@ app.post('/api/admin/orders/:id/restore', requireAuth, requireRole('ADMIN', 'OWN
   if (!order.deleted_at) return res.json({ ok: true, restored: true, alreadyActive: true, orderId: id });
 
   await db.prepare(`UPDATE orders SET deleted_at = NULL, deleted_by = NULL, delete_reason = NULL WHERE id = ?`).run(id);
-  logAuditFromReq(req, {
+  await logAuditFromReq(req, {
     action: 'ORDER_RESTORED',
     entityType: 'order',
     entityId: id,
@@ -3637,7 +3640,7 @@ app.post('/api/admin/orders/:id/shipment', requireAuth, requireRole('ADMIN', 'OW
     await addOrderHistory(id, 'DELIVERED', `Automatische levering via ${carrier} tracking`, req.user.id);
   }
 
-  logAuditFromReq(req, {
+  await logAuditFromReq(req, {
     action: 'ORDER_SHIPMENT_UPDATED',
     entityType: 'order',
     entityId: id,
@@ -3683,7 +3686,7 @@ app.post('/api/admin/shipping/events', requireAuth, requireRole('ADMIN', 'OWNER'
     await addOrderHistory(orderId, 'DELIVERED', `Automatische levering via ${carrier} tracking`, req.user.id);
   }
 
-  logAuditFromReq(req, {
+  await logAuditFromReq(req, {
     action: 'ORDER_SHIPPING_EVENT_INGESTED',
     entityType: 'order',
     entityId: orderId,
@@ -3734,7 +3737,7 @@ app.post('/api/admin/orders/:id/approve', requireAuth, requireRole('ADMIN', 'OWN
     await addOrderHistory(order.id, 'APPROVED', 'Order goedgekeurd door admin', req.user.id);
     await finalizeInvoiceForOrder(order.id, config);
 
-    logAuditFromReq(req, {
+    await logAuditFromReq(req, {
       action: 'ORDER_APPROVED',
       entityType: 'order',
       entityId: order.id,
@@ -3782,7 +3785,7 @@ app.post('/api/admin/orders/:id/send-payment-link', requireAuth, requireRole('AD
     await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('APPROVED_AWAITING_PAYMENT', order.id);
     await addOrderHistory(order.id, 'APPROVED_AWAITING_PAYMENT', 'Betaallink verstuurd naar klant', req.user.id);
 
-    logAuditFromReq(req, {
+    await logAuditFromReq(req, {
       action: 'PAYMENT_LINK_SENT',
       entityType: 'order',
       entityId: order.id,
@@ -3841,9 +3844,11 @@ app.post('/api/admin/orders/:id/send-invoice', requireAuth, requireRole('ADMIN',
 
     const config = await getConfig();
     // Ensure invoice is finalized
-    let invoice = ensureInvoiceForOrder(order.id, config) || getInvoiceByOrderId(order.id);
+    let invoice = await ensureInvoiceForOrder(order.id, config);
+    if (!invoice) invoice = await getInvoiceByOrderId(order.id);
     if (!invoice || invoice.status === 'CONCEPT') {
-      invoice = finalizeInvoiceForOrder(order.id, config) || getInvoiceByOrderId(order.id);
+      invoice = await finalizeInvoiceForOrder(order.id, config);
+      if (!invoice) invoice = await getInvoiceByOrderId(order.id);
     }
 
     const attachment = await buildInvoiceAttachmentForOrder(order.id);
@@ -3871,7 +3876,7 @@ app.post('/api/admin/orders/:id/send-invoice', requireAuth, requireRole('ADMIN',
       // Fall back: send plain email via nodemailer directly
       const transporter = await getMailerTransport();
       if (!transporter) return res.status(500).json({ error: 'SMTP niet geconfigureerd' });
-      const data = collectOrderDocumentData(id);
+      const data = await collectOrderDocumentData(id);
       const pdf = data ? await generateInvoicePdfBuffer(data, config) : null;
       const brandName = config.brand?.name || 'Uw leverancier';
       const bodyHtml = `<p>Beste ${htmlEscape(customerName)},</p><p>Hierbij vindt u de factuur <strong>${htmlEscape(invoiceNo)}</strong> voor uw bestelling #${formatOrderId(order.id)} in bijlage.</p>`;
@@ -3889,7 +3894,7 @@ app.post('/api/admin/orders/:id/send-invoice', requireAuth, requireRole('ADMIN',
     }
 
     await addOrderHistory(order.id, order.status, 'Factuur per e-mail verstuurd', req.user.id);
-    logAuditFromReq(req, {
+    await logAuditFromReq(req, {
       action: 'INVOICE_SENT',
       entityType: 'order',
       entityId: order.id,
@@ -3914,7 +3919,8 @@ app.post('/api/admin/orders/:id/create-deposit-invoice', requireAuth, requireRol
     }
 
     const cfg = await getConfig();
-    const finalInvoice = ensureInvoiceForOrder(orderId, cfg) || getInvoiceByOrderId(orderId);
+    let finalInvoice = await ensureInvoiceForOrder(orderId, cfg);
+    if (!finalInvoice) finalInvoice = await getInvoiceByOrderId(orderId);
     const total = Math.max(0, Number(order.total) || 0);
     const pctRaw = Number(req.body?.depositPercentage);
     const amountRaw = Number(req.body?.depositAmount);
@@ -3953,7 +3959,7 @@ app.post('/api/admin/orders/:id/create-deposit-invoice', requireAuth, requireRol
     await db.prepare('UPDATE deposit_invoices SET invoice_number = ? WHERE id = ?').run(invoiceNumber, depositId);
     const created = await db.prepare('SELECT * FROM deposit_invoices WHERE id = ?').get(depositId);
 
-    logAuditFromReq(req, {
+    await logAuditFromReq(req, {
       action: 'DEPOSIT_INVOICE_CREATED',
       entityType: 'order',
       entityId: orderId,
@@ -4011,7 +4017,8 @@ app.post('/api/admin/orders/:id/send-deposit-invoice', requireAuth, requireRole(
     const cfg = await getConfig();
     const depositInvoice = await getLatestDepositInvoiceByOrderId(orderId);
     if (!depositInvoice) return res.status(404).json({ error: 'Geen voorschotfactuur gevonden' });
-    const finalInvoice = ensureInvoiceForOrder(orderId, cfg) || getInvoiceByOrderId(orderId);
+    let finalInvoice = await ensureInvoiceForOrder(orderId, cfg);
+    if (!finalInvoice) finalInvoice = await getInvoiceByOrderId(orderId);
     const pdf = await generateDepositInvoicePdfBuffer({ order, depositInvoice, finalInvoice }, cfg);
     const customerName = `${order.customer_first || ''} ${order.customer_last || ''}`.trim() || order.customer_email;
     const trackingToken = createEmailTrackingToken(order.id, 'deposit_invoice', order.customer_email);
@@ -4072,7 +4079,7 @@ app.post('/api/admin/orders/:id/send-deposit-invoice', requireAuth, requireRole(
       await addOrderHistory(order.id, order.status, 'Voorschotfactuur per e-mail verstuurd', req.user.id);
     }
 
-    logAuditFromReq(req, {
+    await logAuditFromReq(req, {
       action: 'DEPOSIT_INVOICE_SENT',
       entityType: 'order',
       entityId: order.id,
@@ -4090,7 +4097,7 @@ app.post('/api/admin/orders/:id/send-deposit-invoice', requireAuth, requireRole(
 app.get('/api/admin/orders/:id/offer.pdf', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const data = collectOrderDocumentData(id);
+    const data = await collectOrderDocumentData(id);
     if (!data) return res.status(404).json({ error: 'Order niet gevonden' });
     const pdf = await generateOfferPdfBuffer(data, await getConfig());
     const name = safeFilename(`offerte-${formatOrderId(id)}.pdf`);
@@ -4112,7 +4119,7 @@ app.post('/api/admin/orders/:id/send-offer', requireAuth, requireRole('ADMIN', '
     if (!order.customer_email) return res.status(400).json({ error: 'Klant heeft geen e-mailadres' });
 
     const cfg = await getConfig();
-    const data = collectOrderDocumentData(id);
+    const data = await collectOrderDocumentData(id);
     if (!data) return res.status(404).json({ error: 'Orderdata ontbreekt' });
     const pdf = await generateOfferPdfBuffer(data, cfg);
     const customerName = `${order.customer_first || ''} ${order.customer_last || ''}`.trim() || order.customer_email;
@@ -4154,7 +4161,7 @@ app.post('/api/admin/orders/:id/send-offer', requireAuth, requireRole('ADMIN', '
 
     if (!info?.ok) return res.status(500).json({ error: 'Offerte e-mail kon niet verzonden worden' });
     await addOrderHistory(order.id, order.status, 'Offerte per e-mail verstuurd', req.user.id);
-    logAuditFromReq(req, {
+    await logAuditFromReq(req, {
       action: 'OFFER_SENT',
       entityType: 'order',
       entityId: order.id,
@@ -4171,7 +4178,7 @@ app.post('/api/admin/orders/:id/send-offer', requireAuth, requireRole('ADMIN', '
 app.get('/api/admin/orders/:id/invoice.pdf', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const data = collectOrderDocumentData(id);
+    const data = await collectOrderDocumentData(id);
     if (!data) return res.status(404).json({ error: 'Order niet gevonden' });
     const cfg = await getConfig();
     const pdf = await generateInvoicePdfBuffer(data, cfg);
@@ -4189,7 +4196,7 @@ app.get('/api/admin/orders/:id/invoice.pdf', requireAuth, requireRole('ADMIN', '
 app.get('/api/admin/orders/:id/packing-slip.pdf', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const data = collectOrderDocumentData(id);
+    const data = await collectOrderDocumentData(id);
     if (!data) return res.status(404).json({ error: 'Order niet gevonden' });
     const pdf = await generatePackingSlipPdfBuffer(data, await getConfig());
     const name = safeFilename(`orderbon-${formatOrderId(id)}.pdf`);
@@ -4306,7 +4313,7 @@ app.put('/api/admin/users/:id(\\d+)', requireAuth, requireRole('OWNER'), async (
     const pieces = [];
     if (roleChanged) pieces.push(`rol ${target.role} -> ${role}`);
     if (statusChanged) pieces.push(`status ${target.status} -> ${status}`);
-    logAuditFromReq(req, {
+    await logAuditFromReq(req, {
       action: 'USER_UPDATED', entityType: 'user', entityId: id,
       summary: `Gebruiker ${target.email} gewijzigd (${pieces.join(', ')})`,
       details: {
@@ -4338,7 +4345,7 @@ app.delete('/api/admin/users/:id(\\d+)', requireAuth, requireRole('OWNER'), asyn
   const target = await db.prepare('SELECT id, email, role, status FROM users WHERE id = ?').get(id);
   await db.prepare('DELETE FROM users WHERE id = ?').run(id);
   if (target) {
-    logAuditFromReq(req, {
+    await logAuditFromReq(req, {
       action: 'USER_DELETED',
       entityType: 'user',
       entityId: id,
@@ -4509,7 +4516,7 @@ app.put('/api/admin/config', requireAuth, requireRole('OWNER'), async (req, res)
   await setSetting('config', next);
   const saved = await getConfig();
   const audit = buildConfigAuditChangeSet(before, saved);
-  logAuditFromReq(req, {
+  await logAuditFromReq(req, {
     action: 'CONFIG_UPDATED',
     entityType: 'config',
     entityId: 'main',
@@ -4551,7 +4558,7 @@ app.post('/api/admin/branding/upload', requireAuth, requireRole('OWNER'), brandi
     fs.writeFileSync(outAbs, optimized);
     const relPath = `assets/branding/${outName}`;
 
-    logAuditFromReq(req, {
+    await logAuditFromReq(req, {
       action: 'CONFIG_UPDATED',
       entityType: 'config',
       entityId: 'main',
@@ -4590,7 +4597,7 @@ app.post('/api/admin/products/mockup', requireAuth, requireRole('OWNER', 'ADMIN'
     fs.writeFileSync(outAbs, optimized);
     const relPath = `assets/products/${outName}`;
 
-    logAuditFromReq(req, {
+    await logAuditFromReq(req, {
       action: 'CONFIG_UPDATED',
       entityType: 'config',
       entityId: 'main',
@@ -4866,7 +4873,7 @@ app.put('/api/admin/config/stripe', requireAuth, requireRole('OWNER'), async (re
       return res.status(400).json({ error: `Stripe verbindingstest mislukt: ${err.message}` });
     }
   }
-  logAuditFromReq(req, { action: 'CONFIG_UPDATED', entityType: 'STRIPE', summary: 'Stripe configuratie bijgewerkt' });
+  await logAuditFromReq(req, { action: 'CONFIG_UPDATED', entityType: 'STRIPE', summary: 'Stripe configuratie bijgewerkt' });
   res.json({ ok: true });
 });
 
