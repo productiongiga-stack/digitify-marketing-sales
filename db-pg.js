@@ -79,10 +79,15 @@ function convertDatetime(sql) {
     .replace(/datetime\s*\(\s*([^)]+)\s*\)/gi, '$1::timestamptz');
 }
 
-/** Detect INSERT and append RETURNING id if not already present */
+/** Detect INSERT and append RETURNING id if not already present.
+ *  Skip tables that don't have an `id` column (e.g. settings with `key` PK). */
+const NO_ID_TABLES = new Set(['settings']);
 function maybeAddReturning(sql) {
   const trimmed = sql.trim().toUpperCase();
   if (trimmed.startsWith('INSERT') && !trimmed.includes('RETURNING')) {
+    // Extract table name: INSERT INTO tablename ...
+    const m = trimmed.match(/INSERT\s+INTO\s+["']?(\w+)/i);
+    if (m && NO_ID_TABLES.has(m[1].toLowerCase())) return sql;
     return sql.replace(/;?\s*$/, '') + ' RETURNING id';
   }
   return sql;
