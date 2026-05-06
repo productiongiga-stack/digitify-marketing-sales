@@ -4,7 +4,6 @@ const express = require('express');
 const session = require('express-session');
 const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcryptjs');
-const Database = require('better-sqlite3');
 const multer = require('multer');
 const Stripe = require('stripe');
 const nodemailer = require('nodemailer');
@@ -15,8 +14,10 @@ const QRCode = require('qrcode');
 const archiver = require('archiver');
 const crypto = require('crypto');
 
-const { db, getConfig, setSetting, getSetting, ensureOwner, getOrCreateSecret, sortSizes, encryptSetting, decryptSetting } = require('./db');
+const { db, getConfig, setSetting, getSetting, ensureOwner, getOrCreateSecret, sortSizes, encryptSetting, decryptSetting, initDatabase, USE_PG, sanitizeProducts } = require('./db');
 const { version: APP_VERSION = '0.0.0' } = require('./package.json');
+// Only load better-sqlite3 when in SQLite mode (for backup/restore)
+const Database = USE_PG ? null : require('better-sqlite3');
 
 const PORT = process.env.PORT || 3737;
 const ROOT = __dirname;
@@ -29,7 +30,18 @@ const UPLOAD_DIR = path.join(ROOT, 'uploads');
 const CART_DIR = path.join(UPLOAD_DIR, 'cart');
 const ORDER_DIR = path.join(UPLOAD_DIR, 'orders');
 const BACKUP_DIR = path.join(ROOT, 'data', 'backups');
-[UPLOAD_DIR, CART_DIR, ORDER_DIR, BACKUP_DIR, BRAND_ASSET_DIR, PRODUCT_ASSET_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
+
+// On Vercel (serverless), skip directory creation for non-/tmp paths
+if (!USE_PG) {
+  [UPLOAD_DIR, CART_DIR, ORDER_DIR, BACKUP_DIR, BRAND_ASSET_DIR, PRODUCT_ASSET_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
+} else {
+  // Vercel: only /tmp is writable
+  const TMP_UPLOAD = path.join('/tmp', 'uploads');
+  const TMP_CART = path.join(TMP_UPLOAD, 'cart');
+  const TMP_ORDER = path.join(TMP_UPLOAD, 'orders');
+  [TMP_UPLOAD, TMP_CART, TMP_ORDER].forEach(d => fs.mkdirSync(d, { recursive: true }));
+}
+
 const cartUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024, files: 25 },
@@ -61,16 +73,6 @@ const productMockupUpload = multer({
   }
 });
 
-const seeded = ensureOwner();
-if (seeded) {
-  console.log('\n========================================');
-  console.log(' OWNER ACCOUNT AANGEMAAKT');
-  console.log(` Email:    ${seeded.email}`);
-  console.log(` Password: ${seeded.password}`);
-  console.log(' Wijzig dit wachtwoord direct na eerste login (/account)');
-  console.log('========================================\n');
-}
-
 const app = express();
 app.set('trust proxy', 1);
 const APP_STARTED_AT = Date.now();
@@ -80,17 +82,35 @@ app.use(express.json({
 }));
 app.use(express.urlencoded({ extended: true }));
 
-app.use(session({
-  secret: getOrCreateSecret(),
-  resave: false,
-  saveUninitialized: false,
-  cookie: { httpOnly: true, sameSite: 'lax', maxAge: SESSION_REMEMBER_MAX_AGE_MS }
-}));
+// Session and DB init happen in async boot()
+let _booted = false;
+async function boot() {
+  if (_booted) return;
+  _booted = true;
+  await initDatabase();
+  const secret = await getOrCreateSecret();
+  if (!UPLOAD_SIGNING_SECRET) UPLOAD_SIGNING_SECRET = secret.trim();
+  app.use(session({
+    secret,
+    resave: false,
+    saveUninitialized: false,
+    cookie: { httpOnly: true, sameSite: 'lax', maxAge: SESSION_REMEMBER_MAX_AGE_MS }
+  }));
+  const seeded = await ensureOwner();
+  if (seeded) {
+    console.log('\n========================================');
+    console.log(' OWNER ACCOUNT AANGEMAAKT');
+    console.log(` Email:    ${seeded.email}`);
+    console.log(` Password: ${seeded.password}`);
+    console.log(' Wijzig dit wachtwoord direct na eerste login (/account)');
+    console.log('========================================\n');
+  }
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
-function currentUser(req) {
+async function currentUser(req) {
   if (!req.session.userId) return null;
-  return db.prepare(`SELECT id, email, first_name, last_name, role, status, address, postcode, city, phone, totp_enabled, email_verified
+  return await db.prepare(`SELECT id, email, first_name, last_name, role, status, address, postcode, city, phone, totp_enabled, email_verified
                      FROM users WHERE id = ?`).get(req.session.userId);
 }
 function isStaffRole(role) {
@@ -113,8 +133,8 @@ function finalizeAuthenticatedSession(req, user, remember) {
   req.session.force2faSetup = (user.role === 'ADMIN') && !Number(user.totp_enabled || 0);
   applyRememberCookie(req, remember);
 }
-function requireAuth(req, res, next) {
-  const u = currentUser(req);
+async function requireAuth(req, res, next) {
+  const u = await currentUser(req);
   if (!u) return res.status(401).json({ error: 'Niet ingelogd' });
   if (u.status !== 'ACTIVE') return res.status(403).json({ error: 'Account wacht op goedkeuring' });
   if (req.session.force2faSetup && u.role === 'ADMIN' && !Number(u.totp_enabled || 0)) {
@@ -184,20 +204,20 @@ function normalizeUploadPath(input) {
   if (!absPath.startsWith(UPLOAD_DIR)) return null;
   return { rel: parts.join('/'), abs: absPath, parts };
 }
-function canUserAccessUploadByParts(user, parts) {
+async function canUserAccessUploadByParts(user, parts) {
   if (!user || !parts?.length) return false;
   const isStaff = user.role === 'OWNER' || user.role === 'ADMIN';
   if (isStaff) return true;
   if (parts[0] === 'cart') {
     const itemId = Number(parts[1]);
     if (!Number.isInteger(itemId) || itemId <= 0) return false;
-    const ok = db.prepare('SELECT 1 FROM cart_items WHERE id = ? AND user_id = ?').get(itemId, user.id);
+    const ok = await db.prepare('SELECT 1 FROM cart_items WHERE id = ? AND user_id = ?').get(itemId, user.id);
     return !!ok;
   }
   if (parts[0] === 'orders') {
     const orderId = Number(parts[1]);
     if (!Number.isInteger(orderId) || orderId <= 0) return false;
-    const ok = db.prepare('SELECT 1 FROM orders WHERE id = ? AND user_id = ?').get(orderId, user.id);
+    const ok = await db.prepare('SELECT 1 FROM orders WHERE id = ? AND user_id = ?').get(orderId, user.id);
     return !!ok;
   }
   return false;
@@ -267,32 +287,33 @@ const SHIPPING_CARRIERS = ['POSTNL', 'BPOST', 'GLS'];
 const SHIPPING_STATUS = ['UNKNOWN', 'PRE_ADVICE', 'IN_TRANSIT', 'OUT_FOR_DELIVERY', 'DELIVERED', 'EXCEPTION', 'RETURNED'];
 
 const APP_BASE_URL = (process.env.APP_BASE_URL || process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
-const UPLOAD_SIGNING_SECRET = (process.env.UPLOAD_SIGNING_SECRET || getOrCreateSecret()).trim();
+let UPLOAD_SIGNING_SECRET = process.env.UPLOAD_SIGNING_SECRET || '';
+// Will be resolved in boot() if not set via env
 
-function getStripeSecretKey() {
+async function getStripeSecretKey() {
   if (process.env.STRIPE_SECRET_KEY) return process.env.STRIPE_SECRET_KEY.trim();
-  const enc = getSetting('stripe_secret_key_enc');
-  if (enc) return decryptSetting(enc);
+  const enc = await getSetting('stripe_secret_key_enc');
+  if (enc) return await decryptSetting(enc);
   return '';
 }
 
-function getStripeWebhookSecret() {
+async function getStripeWebhookSecret() {
   if (process.env.STRIPE_WEBHOOK_SECRET) return process.env.STRIPE_WEBHOOK_SECRET.trim();
-  const enc = getSetting('stripe_webhook_secret_enc');
-  if (enc) return decryptSetting(enc);
+  const enc = await getSetting('stripe_webhook_secret_enc');
+  if (enc) return await decryptSetting(enc);
   return '';
 }
 
-function getAppBaseUrl() {
+async function getAppBaseUrl() {
   if (process.env.APP_BASE_URL || process.env.PUBLIC_BASE_URL) return APP_BASE_URL;
-  const stored = getSetting('stripe_app_base_url');
+  const stored = await getSetting('stripe_app_base_url');
   return stored ? String(stored).replace(/\/+$/, '') : APP_BASE_URL;
 }
 
 let _stripeCache = null;
 let _stripeCacheKey = null;
-function getStripeClient() {
-  const key = getStripeSecretKey();
+async function getStripeClient() {
+  const key = await getStripeSecretKey();
   if (!key) return null;
   if (_stripeCache && _stripeCacheKey === key) return _stripeCache;
   _stripeCache = new Stripe(key);
@@ -356,28 +377,28 @@ function isOrderArchived(order) {
   return !!(order && order.deleted_at);
 }
 
-function getOrderById(id) {
-  return db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+async function getOrderById(id) {
+  return await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
 }
 
-function addOrderHistory(orderId, status, note, changedBy = null) {
-  db.prepare(`INSERT INTO order_status_history(order_id, status, note, changed_by)
+async function addOrderHistory(orderId, status, note, changedBy = null) {
+  await db.prepare(`INSERT INTO order_status_history(order_id, status, note, changed_by)
               VALUES(?, ?, ?, ?)`).run(orderId, status, note || '', changedBy);
 }
 
-function logAudit({ actorUserId = null, actorEmail = null, action, entityType, entityId = null, summary, details = null }) {
+async function logAudit({ actorUserId = null, actorEmail = null, action, entityType, entityId = null, summary, details = null }) {
   if (!action || !entityType || !summary) return;
   let detailsJson = null;
   if (details != null) {
     try { detailsJson = JSON.stringify(details); } catch { detailsJson = null; }
   }
-  db.prepare(`INSERT INTO audit_log(actor_user_id, actor_email, action, entity_type, entity_id, summary, details)
+  await db.prepare(`INSERT INTO audit_log(actor_user_id, actor_email, action, entity_type, entity_id, summary, details)
               VALUES(?, ?, ?, ?, ?, ?, ?)`)
     .run(actorUserId, actorEmail || null, action, entityType, entityId == null ? null : String(entityId), summary, detailsJson);
 }
 
-function logAuditFromReq(req, payload) {
-  logAudit({
+async function logAuditFromReq(req, payload) {
+  await logAudit({
     actorUserId: req.user?.id || null,
     actorEmail: req.user?.email || null,
     ...payload
@@ -468,7 +489,7 @@ function getOrderIdFromSession(checkoutSession) {
 }
 
 async function createCheckoutSessionForOrder(order, config) {
-  const stripe = getStripeClient();
+  const stripe = await getStripeClient();
   if (!stripe) throw new Error('Stripe is niet geconfigureerd. Ga naar Instellingen → Betalingen om je Stripe-sleutels in te vullen.');
   const currency = normalizeCurrency(config?.checkout?.currency || 'EUR');
   const unitAmount = amountToMinor(order.total, currency);
@@ -507,17 +528,17 @@ async function createCheckoutSessionForOrder(order, config) {
   };
 }
 
-function upsertPaymentStatusFromCheckoutEvent(checkoutSession, eventType, eventId = null) {
+async function upsertPaymentStatusFromCheckoutEvent(checkoutSession, eventType, eventId = null) {
   const orderId = getOrderIdFromSession(checkoutSession);
   if (!orderId) return;
-  const order = getOrderById(orderId);
+  const order = await getOrderById(orderId);
   if (!order || isOrderArchived(order)) return;
 
   const checkoutId = checkoutSession?.id || null;
   const paymentIntentId = checkoutSession?.payment_intent || null;
   const paymentStatus = String(checkoutSession?.payment_status || '').toLowerCase();
   const row = checkoutId
-    ? db.prepare(`SELECT * FROM payments WHERE provider = 'STRIPE' AND provider_checkout_id = ?
+    ? await db.prepare(`SELECT * FROM payments WHERE provider = 'STRIPE' AND provider_checkout_id = ?
                   ORDER BY id DESC LIMIT 1`).get(checkoutId)
     : null;
   if (!row) return;
@@ -531,46 +552,46 @@ function upsertPaymentStatusFromCheckoutEvent(checkoutSession, eventType, eventI
 
   if (eventType === 'checkout.session.completed' && paymentStatus === 'paid') {
     const becamePaid = row.status !== 'PAID';
-    db.prepare(`UPDATE payments
+    await db.prepare(`UPDATE payments
                 SET status='PAID', provider_payment_id=COALESCE(?, provider_payment_id),
                     paid_at=datetime('now'), failure_reason=NULL, metadata=?
                 WHERE id = ?`).run(paymentIntentId, JSON.stringify(meta), row.id);
     if (order.status !== 'PAID' && !FINAL_ORDER_STATUS.includes(order.status)) {
-      db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('PAID', orderId);
-      addOrderHistory(orderId, 'PAID', 'Betaling bevestigd via Stripe webhook', null);
+      await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('PAID', orderId);
+      await addOrderHistory(orderId, 'PAID', 'Betaling bevestigd via Stripe webhook', null);
     }
-    markInvoicePaid(orderId);
+    await markInvoicePaid(orderId);
     if (becamePaid && order.customer_email) {
-      sendPaymentReceivedEmailWithInvoiceSafe(order);
+      await sendPaymentReceivedEmailWithInvoiceSafe(order);
     }
     return;
   }
 
   if (eventType === 'checkout.session.async_payment_succeeded') {
     const becamePaid = row.status !== 'PAID';
-    db.prepare(`UPDATE payments
+    await db.prepare(`UPDATE payments
                 SET status='PAID', provider_payment_id=COALESCE(?, provider_payment_id),
                     paid_at=datetime('now'), failure_reason=NULL, metadata=?
                 WHERE id = ?`).run(paymentIntentId, JSON.stringify(meta), row.id);
     if (order.status !== 'PAID' && !FINAL_ORDER_STATUS.includes(order.status)) {
-      db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('PAID', orderId);
-      addOrderHistory(orderId, 'PAID', 'Asynchrone betaling bevestigd via Stripe webhook', null);
+      await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('PAID', orderId);
+      await addOrderHistory(orderId, 'PAID', 'Asynchrone betaling bevestigd via Stripe webhook', null);
     }
-    markInvoicePaid(orderId);
+    await markInvoicePaid(orderId);
     if (becamePaid && order.customer_email) {
-      sendPaymentReceivedEmailWithInvoiceSafe(order);
+      await sendPaymentReceivedEmailWithInvoiceSafe(order);
     }
     return;
   }
 
   if (eventType === 'checkout.session.completed' && paymentStatus !== 'paid') {
     const becamePending = row.status !== 'PENDING';
-    db.prepare(`UPDATE payments
+    await db.prepare(`UPDATE payments
                 SET status='PENDING', provider_payment_id=COALESCE(?, provider_payment_id), metadata=?
                 WHERE id = ?`).run(paymentIntentId, JSON.stringify(meta), row.id);
     if (!FINAL_ORDER_STATUS.includes(order.status) && order.status !== 'PAYMENT_PENDING') {
-      db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('PAYMENT_PENDING', orderId);
-      addOrderHistory(orderId, 'PAYMENT_PENDING', 'Checkout afgerond, betaling nog in behandeling', null);
+      await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('PAYMENT_PENDING', orderId);
+      await addOrderHistory(orderId, 'PAYMENT_PENDING', 'Checkout afgerond, betaling nog in behandeling', null);
     }
     if (becamePending && order.customer_email) {
       sendTemplatedEmailSafe('orderStatusChanged', order.customer_email, {
@@ -584,12 +605,12 @@ function upsertPaymentStatusFromCheckoutEvent(checkoutSession, eventType, eventI
   }
 
   if (eventType === 'checkout.session.async_payment_failed' || eventType === 'checkout.session.expired') {
-    db.prepare(`UPDATE payments
+    await db.prepare(`UPDATE payments
                 SET status='FAILED', failure_reason=?, metadata=?
                 WHERE id = ?`).run(eventType, JSON.stringify(meta), row.id);
     if (!FINAL_ORDER_STATUS.includes(order.status) && order.status !== 'APPROVED_AWAITING_PAYMENT') {
-      db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('APPROVED_AWAITING_PAYMENT', orderId);
-      addOrderHistory(orderId, 'APPROVED_AWAITING_PAYMENT', 'Betaling mislukt of verlopen, nieuwe betaallink vereist', null);
+      await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('APPROVED_AWAITING_PAYMENT', orderId);
+      await addOrderHistory(orderId, 'APPROVED_AWAITING_PAYMENT', 'Betaling mislukt of verlopen, nieuwe betaallink vereist', null);
     }
   }
 }
@@ -667,21 +688,22 @@ function computeInvoiceDueDateIso(issueDate, paymentTermsDays = 0) {
   return due.toISOString();
 }
 
-function getInvoiceByOrderId(orderId) {
-  return db.prepare('SELECT * FROM invoices WHERE order_id = ?').get(orderId);
+async function getInvoiceByOrderId(orderId) {
+  return await db.prepare('SELECT * FROM invoices WHERE order_id = ?').get(orderId);
 }
 
-function ensureInvoiceForOrder(orderId, config = getConfig()) {
+async function ensureInvoiceForOrder(orderId, config) {
+  if (!config) config = await getConfig();
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) return null;
-  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+  const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
   if (!order) return null;
   let inv = getInvoiceByOrderId(id);
   if (inv) return inv;
   const now = new Date();
   const dueIso = computeInvoiceDueDateIso(now, config?.documents?.invoice?.paymentTermsDays);
   const invoiceNo = buildInvoiceNumber(order, config, now);
-  const paidPayment = db.prepare(`SELECT paid_at FROM payments WHERE order_id = ? AND status = 'PAID'
+  const paidPayment = await db.prepare(`SELECT paid_at FROM payments WHERE order_id = ? AND status = 'PAID'
                                   ORDER BY id DESC LIMIT 1`).get(id);
   const derivedStatus = order.status === 'PAID'
     ? 'PAID'
@@ -690,21 +712,22 @@ function ensureInvoiceForOrder(orderId, config = getConfig()) {
       : (['APPROVED_AWAITING_PAYMENT', 'PAYMENT_PENDING', 'IN_PRODUCTION', 'SHIPPED', 'DELIVERED'].includes(order.status)
         ? 'DEFINITIVE'
         : 'CONCEPT'));
-  db.prepare(`INSERT INTO invoices(order_id, invoice_number, status, issue_date, due_date, metadata)
+  await db.prepare(`INSERT INTO invoices(order_id, invoice_number, status, issue_date, due_date, metadata)
               VALUES(?, ?, ?, ?, ?, ?)`)
     .run(id, invoiceNo, derivedStatus, now.toISOString(), dueIso, JSON.stringify({ source: 'order_created_backfill' }));
   if (derivedStatus === 'PAID' && paidPayment?.paid_at) {
-    db.prepare(`UPDATE invoices SET paid_at = ?, finalized_at = COALESCE(finalized_at, ?) WHERE order_id = ?`)
+    await db.prepare(`UPDATE invoices SET paid_at = ?, finalized_at = COALESCE(finalized_at, ?) WHERE order_id = ?`)
       .run(parseSqliteDate(paidPayment.paid_at)?.toISOString() || now.toISOString(), now.toISOString(), id);
   } else if (derivedStatus === 'DEFINITIVE') {
-    db.prepare(`UPDATE invoices SET finalized_at = COALESCE(finalized_at, ?) WHERE order_id = ?`)
+    await db.prepare(`UPDATE invoices SET finalized_at = COALESCE(finalized_at, ?) WHERE order_id = ?`)
       .run(now.toISOString(), id);
   }
   return getInvoiceByOrderId(id);
 }
 
-function backfillMissingInvoices(config = getConfig(), limit = 300) {
-  const rows = db.prepare(`
+async function backfillMissingInvoices(config, limit = 300) {
+  if (!config) config = await getConfig();
+  const rows = await db.prepare(`
     SELECT o.id
     FROM orders o
     LEFT JOIN invoices i ON i.order_id = o.id
@@ -716,38 +739,39 @@ function backfillMissingInvoices(config = getConfig(), limit = 300) {
   return rows.length;
 }
 
-function finalizeInvoiceForOrder(orderId, config = getConfig()) {
+async function finalizeInvoiceForOrder(orderId, config) {
+  if (!config) config = await getConfig();
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) return null;
-  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+  const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
   if (!order) return null;
   const now = new Date();
   const dueIso = computeInvoiceDueDateIso(now, config?.documents?.invoice?.paymentTermsDays);
   const invoiceNo = buildInvoiceNumber(order, config, now);
-  ensureInvoiceForOrder(id, config);
-  db.prepare(`UPDATE invoices
+  await ensureInvoiceForOrder(id, config);
+  await db.prepare(`UPDATE invoices
               SET invoice_number = ?, status = 'DEFINITIVE', issue_date = ?, due_date = ?, finalized_at = ?, metadata = ?
               WHERE order_id = ? AND status != 'PAID'`)
     .run(invoiceNo, now.toISOString(), dueIso, now.toISOString(), JSON.stringify({ source: 'order_approved' }), id);
   return getInvoiceByOrderId(id);
 }
 
-function markInvoicePaid(orderId) {
+async function markInvoicePaid(orderId) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) return;
   const nowIso = new Date().toISOString();
-  ensureInvoiceForOrder(id, getConfig());
-  db.prepare(`UPDATE invoices
+  await ensureInvoiceForOrder(id, await getConfig());
+  await db.prepare(`UPDATE invoices
               SET status = 'PAID', paid_at = ?, finalized_at = COALESCE(finalized_at, ?)
               WHERE order_id = ?`)
     .run(nowIso, nowIso, id);
 }
 
-function markInvoiceVoid(orderId) {
+async function markInvoiceVoid(orderId) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) return;
-  ensureInvoiceForOrder(id, getConfig());
-  db.prepare(`UPDATE invoices
+  await ensureInvoiceForOrder(id, await getConfig());
+  await db.prepare(`UPDATE invoices
               SET status = CASE WHEN status = 'PAID' THEN status ELSE 'VOID' END
               WHERE order_id = ?`)
     .run(id);
@@ -922,8 +946,8 @@ function renderIndexWithSeo(config) {
   return html;
 }
 
-function resolveCatalogProduct(rawProduct = {}, config = null) {
-  const cfg = config || getConfig();
+async function resolveCatalogProduct(rawProduct = {}, config = null) {
+  const cfg = config || await getConfig();
   const catalog = Array.isArray(cfg?.products) ? cfg.products : [];
   const enabled = catalog.filter(p => p && p.enabled !== false);
   const fallback = enabled.find(p => p.isDefault) || enabled[0] || {
@@ -967,8 +991,9 @@ function roundMoney(value) {
 // - Pricing is server-authoritative from this helper.
 // - Legacy priceMultiplier/global fallbacks stay supported.
 // - Public /api/config wire-shape remains backward compatible.
-function computeItemPrice(rawItem = {}, config = getConfig()) {
-  const product = resolveCatalogProduct(rawItem, config);
+async function computeItemPrice(rawItem = {}, config) {
+  if (!config) config = await getConfig();
+  const product = await resolveCatalogProduct(rawItem, config);
   const size = String(rawItem?.size || '').trim().toUpperCase();
   const colorHex = normalizeHexColor(rawItem?.colorHex || rawItem?.color_hex || rawItem?.color || '');
   const qty = Math.max(1, Math.min(999, Math.round(Number(rawItem?.qty) || 1)));
@@ -1023,8 +1048,8 @@ function renderTemplate(raw, vars) {
 }
 
 let mailerCache = { key: null, transporter: null };
-function getMailerTransport() {
-  const cfgSmtp = (getConfig().smtp) || {};
+async function getMailerTransport() {
+  const cfgSmtp = ((await getConfig()).smtp) || {};
   const host = (process.env.SMTP_HOST || cfgSmtp.host || '').trim();
   const port = Number(process.env.SMTP_PORT || cfgSmtp.port || 587);
   const user = (process.env.SMTP_USER || cfgSmtp.user || '').trim();
@@ -1046,9 +1071,9 @@ function getMailerTransport() {
   return transporter;
 }
 
-function createEmailTrackingToken(orderId, emailType, recipient = '') {
+async function createEmailTrackingToken(orderId, emailType, recipient = '') {
   const token = crypto.randomBytes(24).toString('hex');
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO email_tracking(token, order_id, email_type, recipient, sent_at)
     VALUES(?, ?, ?, ?, ?)
   `).run(
@@ -1061,8 +1086,8 @@ function createEmailTrackingToken(orderId, emailType, recipient = '') {
   return token;
 }
 
-function getEmailTrackingForOrder(orderId) {
-  return db.prepare(`
+async function getEmailTrackingForOrder(orderId) {
+  return await db.prepare(`
     SELECT id, token, order_id, email_type, recipient, sent_at, first_opened_at, open_count, created_at
     FROM email_tracking
     WHERE order_id = ?
@@ -1146,10 +1171,10 @@ function buildOrderActivityFeed(order, history = [], emailTracking = [], deposit
 async function sendTemplatedEmail(templateKey, to, vars = {}, opts = {}) {
   const toEmail = String(to || '').trim();
   if (!toEmail) return { skipped: 'no_recipient' };
-  const transporter = getMailerTransport();
+  const transporter = await getMailerTransport();
   if (!transporter) return { skipped: 'smtp_not_configured' };
 
-  const cfg = getConfig();
+  const cfg = await getConfig();
   const companyName = cfg?.company?.legalName || cfg?.brand?.name || 'Onze shop';
   const template = cfg?.email?.templates?.[templateKey];
   if (!template?.subject || !template?.html) return { skipped: 'missing_template' };
@@ -1205,7 +1230,8 @@ const INVOICE_REMINDER_RUN = {
   lastAt: 0
 };
 
-async function sendInvoiceReminderForRow(row, cfg = getConfig()) {
+async function sendInvoiceReminderForRow(row, cfg) {
+  if (!cfg) cfg = await getConfig();
   if (!row?.customer_email) return { skipped: 'no_recipient' };
   const vars = {
     orderId: formatOrderId(row.order_id),
@@ -1218,7 +1244,7 @@ async function sendInvoiceReminderForRow(row, cfg = getConfig()) {
   };
   const info = await sendTemplatedEmail('invoiceReminder', row.customer_email, vars);
   if (info?.ok) {
-    db.prepare(`UPDATE invoices
+    await db.prepare(`UPDATE invoices
                 SET last_reminder_at = ?, sent_at = COALESCE(sent_at, ?), reminder_count = reminder_count + 1
                 WHERE id = ?`)
       .run(new Date().toISOString(), new Date().toISOString(), row.id);
@@ -1231,7 +1257,7 @@ async function processInvoiceRemindersSafe(force = false) {
   if (INVOICE_REMINDER_RUN.running) return { skipped: 'running' };
   if (!force && now - INVOICE_REMINDER_RUN.lastAt < 15 * 60 * 1000) return { skipped: 'throttled' };
 
-  const cfg = getConfig();
+  const cfg = await getConfig();
   const invoiceCfg = cfg?.documents?.invoice || {};
   if (invoiceCfg.reminderEnabled === false) return { skipped: 'disabled' };
   const intervalHours = Math.min(240, Math.max(1, Number(invoiceCfg.reminderIntervalHours) || 24));
@@ -1240,7 +1266,7 @@ async function processInvoiceRemindersSafe(force = false) {
   INVOICE_REMINDER_RUN.running = true;
   INVOICE_REMINDER_RUN.lastAt = now;
   try {
-    const rows = db.prepare(`
+    const rows = await db.prepare(`
       SELECT i.*, o.customer_email, o.customer_first, o.customer_last, o.total,
              (SELECT checkout_url FROM payments p WHERE p.order_id = o.id AND p.checkout_url IS NOT NULL
               ORDER BY p.id DESC LIMIT 1) AS checkout_url
@@ -1263,7 +1289,7 @@ async function processInvoiceRemindersSafe(force = false) {
       if (info?.ok) sent++;
     }
     if (sent > 0) {
-      logAudit({
+      await logAudit({
         actorUserId: null,
         actorEmail: null,
         action: 'INVOICE_REMINDER_SENT',
@@ -1286,11 +1312,11 @@ function safeFilename(s) {
   return String(s || 'document').replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
 }
 
-function loadUserGdprExportData(userId) {
+async function loadUserGdprExportData(userId) {
   const uid = Number(userId);
   if (!Number.isInteger(uid) || uid <= 0) throw new Error('Ongeldige gebruiker');
 
-  const user = db.prepare(`
+  const user = await db.prepare(`
     SELECT id, email, first_name, last_name, role, status, address, postcode, city, phone, created_at,
            totp_enabled, totp_enabled_at, failed_login_attempts, last_failed_login_at, login_locked_until
     FROM users
@@ -1298,34 +1324,34 @@ function loadUserGdprExportData(userId) {
   `).get(uid);
   if (!user) return null;
 
-  const orders = db.prepare(`SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC`).all(uid);
+  const orders = await db.prepare(`SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC`).all(uid);
   const orderIds = orders.map(o => o.id);
   const orderIdPlaceholders = orderIds.map(() => '?').join(',');
 
   const orderItems = orderIds.length
-    ? db.prepare(`SELECT * FROM order_items WHERE order_id IN (${orderIdPlaceholders}) ORDER BY id`).all(...orderIds)
+    ? await db.prepare(`SELECT * FROM order_items WHERE order_id IN (${orderIdPlaceholders}) ORDER BY id`).all(...orderIds)
     : [];
   const orderItemIds = orderItems.map(i => i.id);
   const orderItemPlaceholders = orderItemIds.map(() => '?').join(',');
 
   const orderDesigns = orderItemIds.length
-    ? db.prepare(`SELECT * FROM order_designs WHERE order_item_id IN (${orderItemPlaceholders}) ORDER BY id`).all(...orderItemIds)
+    ? await db.prepare(`SELECT * FROM order_designs WHERE order_item_id IN (${orderItemPlaceholders}) ORDER BY id`).all(...orderItemIds)
     : [];
   const orderStatusHistory = orderIds.length
-    ? db.prepare(`SELECT * FROM order_status_history WHERE order_id IN (${orderIdPlaceholders}) ORDER BY id`).all(...orderIds)
+    ? await db.prepare(`SELECT * FROM order_status_history WHERE order_id IN (${orderIdPlaceholders}) ORDER BY id`).all(...orderIds)
     : [];
   const payments = orderIds.length
-    ? db.prepare(`SELECT * FROM payments WHERE order_id IN (${orderIdPlaceholders}) ORDER BY id`).all(...orderIds)
+    ? await db.prepare(`SELECT * FROM payments WHERE order_id IN (${orderIdPlaceholders}) ORDER BY id`).all(...orderIds)
     : [];
   const invoices = orderIds.length
-    ? db.prepare(`SELECT * FROM invoices WHERE order_id IN (${orderIdPlaceholders}) ORDER BY id`).all(...orderIds)
+    ? await db.prepare(`SELECT * FROM invoices WHERE order_id IN (${orderIdPlaceholders}) ORDER BY id`).all(...orderIds)
     : [];
 
-  const cartItems = db.prepare(`SELECT * FROM cart_items WHERE user_id = ? ORDER BY id`).all(uid);
+  const cartItems = await db.prepare(`SELECT * FROM cart_items WHERE user_id = ? ORDER BY id`).all(uid);
   const cartItemIds = cartItems.map(i => i.id);
   const cartItemPlaceholders = cartItemIds.map(() => '?').join(',');
   const cartDesigns = cartItemIds.length
-    ? db.prepare(`SELECT * FROM cart_item_designs WHERE cart_item_id IN (${cartItemPlaceholders}) ORDER BY id`).all(...cartItemIds)
+    ? await db.prepare(`SELECT * FROM cart_item_designs WHERE cart_item_id IN (${cartItemPlaceholders}) ORDER BY id`).all(...cartItemIds)
     : [];
 
   const uploadPathSet = new Set();
@@ -1373,15 +1399,15 @@ function loadUserGdprExportData(userId) {
   };
 }
 
-function collectOrderDocumentData(orderId, opts = {}) {
+async function collectOrderDocumentData(orderId, opts = {}) {
   const includeArchived = !!opts.includeArchived;
-  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+  const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
   if (!order) return null;
   if (!includeArchived && isOrderArchived(order)) return null;
-  const invoice = db.prepare('SELECT * FROM invoices WHERE order_id = ?').get(orderId) || null;
-  const items = db.prepare('SELECT * FROM order_items WHERE order_id = ? ORDER BY id').all(orderId);
-  const payments = db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id DESC').all(orderId);
-  const designs = db.prepare(`SELECT * FROM order_designs WHERE order_item_id IN
+  const invoice = await db.prepare('SELECT * FROM invoices WHERE order_id = ?').get(orderId) || null;
+  const items = await db.prepare('SELECT * FROM order_items WHERE order_id = ? ORDER BY id').all(orderId);
+  const payments = await db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id DESC').all(orderId);
+  const designs = await db.prepare(`SELECT * FROM order_designs WHERE order_item_id IN
                               (SELECT id FROM order_items WHERE order_id = ?)
                               ORDER BY id`).all(orderId);
   const byItem = {};
@@ -1809,7 +1835,7 @@ async function generatePackingSlipPdfBuffer(orderData, config) {
 async function buildInvoiceAttachmentForOrder(orderId) {
   const data = collectOrderDocumentData(orderId);
   if (!data) return null;
-  const cfg = getConfig();
+  const cfg = await getConfig();
   const pdf = await generateInvoicePdfBuffer(data, cfg);
   const invoiceNo = data.invoice?.invoice_number || buildInvoiceNumber(data.order, cfg, new Date());
   return {
@@ -1824,8 +1850,8 @@ function buildDepositInvoiceNumber(depositId, issueDate = new Date()) {
   return `VRK-${year}-${String(Number(depositId) || 0).padStart(6, '0')}`;
 }
 
-function getLatestDepositInvoiceByOrderId(orderId) {
-  return db.prepare(`
+async function getLatestDepositInvoiceByOrderId(orderId) {
+  return await db.prepare(`
     SELECT *
     FROM deposit_invoices
     WHERE order_id = ?
@@ -1981,13 +2007,13 @@ async function generateOfferPdfBuffer(orderData, config) {
 
 async function buildOrderEmailPreview(orderId, type, opts = {}) {
   const id = Number(orderId);
-  const cfg = getConfig();
-  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+  const cfg = await getConfig();
+  const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
   if (!order) throw new Error('Order niet gevonden');
   if (isOrderArchived(order)) throw new Error('Order is gearchiveerd. Zet eerst terug.');
   const invoice = ensureInvoiceForOrder(id, cfg) || getInvoiceByOrderId(id);
-  const payment = db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id DESC LIMIT 1').get(id) || null;
-  const depositInvoice = getLatestDepositInvoiceByOrderId(id);
+  const payment = await db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id DESC LIMIT 1').get(id) || null;
+  const depositInvoice = await getLatestDepositInvoiceByOrderId(id);
   const customerName = `${order.customer_first || ''} ${order.customer_last || ''}`.trim();
 
   const vars = {
@@ -2052,7 +2078,7 @@ async function buildOrderEmailPreview(orderId, type, opts = {}) {
 
 async function sendPaymentLinkEmailWithInvoice(order, payment = null, opts = {}) {
   if (!order?.customer_email) return { skipped: 'no_recipient' };
-  const cfg = opts.config || getConfig();
+  const cfg = opts.config || await getConfig();
   const includeInvoice = opts.includeInvoice !== false;
   let invoice = ensureInvoiceForOrder(order.id, cfg) || getInvoiceByOrderId(order.id);
   if (!invoice || invoice.status === 'CONCEPT') {
@@ -2061,7 +2087,7 @@ async function sendPaymentLinkEmailWithInvoice(order, payment = null, opts = {})
   const attachment = includeInvoice ? await buildInvoiceAttachmentForOrder(order.id) : null;
   const paymentUrl = payment?.checkoutUrl
     || payment?.checkout_url
-    || db.prepare(`SELECT checkout_url FROM payments WHERE order_id = ? AND checkout_url IS NOT NULL ORDER BY id DESC LIMIT 1`).get(order.id)?.checkout_url
+    || (await db.prepare(`SELECT checkout_url FROM payments WHERE order_id = ? AND checkout_url IS NOT NULL ORDER BY id DESC LIMIT 1`).get(order.id))?.checkout_url
     || `${APP_BASE_URL}/dashboard?order=${order.id}`;
   const expiresAt = payment?.expiresAtIso || payment?.payment_link_expires_at || null;
   const vars = {
@@ -2082,9 +2108,9 @@ async function sendPaymentLinkEmailWithInvoice(order, payment = null, opts = {})
     subject: String(opts.subject || '').trim().slice(0, 180) || undefined
   });
     if (info?.ok && invoice?.id) {
-    db.prepare(`UPDATE invoices SET sent_at = COALESCE(sent_at, ?) WHERE id = ?`)
+    await db.prepare(`UPDATE invoices SET sent_at = COALESCE(sent_at, ?) WHERE id = ?`)
       .run(new Date().toISOString(), invoice.id);
-    logAudit({
+    await logAudit({
       actorUserId: opts.actorUserId || null,
       actorEmail: opts.actorEmail || null,
       action: 'INVOICE_EMAIL_SENT',
@@ -2108,7 +2134,7 @@ function sendPaymentLinkEmailWithInvoiceSafe(order, payment = null, opts = {}) {
   });
 }
 
-function sendPaymentReceivedEmailWithInvoiceSafe(order) {
+async function sendPaymentReceivedEmailWithInvoiceSafe(order) {
   if (!order?.customer_email) return;
   (async () => {
     const attachment = await buildInvoiceAttachmentForOrder(order.id);
@@ -2124,20 +2150,20 @@ function sendPaymentReceivedEmailWithInvoiceSafe(order) {
 }
 
 // ── Public config ──────────────────────────────────────────────────────────
-app.get('/api/config', (_req, res) => {
-  const cfg = getConfig();
+app.get('/api/config', async (_req, res) => {
+  const cfg = await getConfig();
   const safe = { ...cfg };
   if (safe.smtp) safe.smtp = { ...safe.smtp, pass: undefined, user: undefined };
   res.json(safe);
 });
 
-app.get('/api/track/open/:token.gif', (req, res) => {
+app.get('/api/track/open/:token.gif', async (req, res) => {
   const token = String(req.params.token || '').trim();
   if (/^[a-f0-9]{24,80}$/i.test(token)) {
-    const row = db.prepare('SELECT id, first_opened_at, open_count FROM email_tracking WHERE token = ?').get(token);
+    const row = await db.prepare('SELECT id, first_opened_at, open_count FROM email_tracking WHERE token = ?').get(token);
     if (row) {
       if (!row.first_opened_at) {
-        db.prepare(`
+        await db.prepare(`
           UPDATE email_tracking
           SET open_count = COALESCE(open_count, 0) + 1,
               first_opened_at = ?,
@@ -2145,7 +2171,7 @@ app.get('/api/track/open/:token.gif', (req, res) => {
           WHERE id = ?
         `).run(new Date().toISOString(), new Date().toISOString(), row.id);
       } else {
-        db.prepare('UPDATE email_tracking SET open_count = COALESCE(open_count, 0) + 1 WHERE id = ?').run(row.id);
+        await db.prepare('UPDATE email_tracking SET open_count = COALESCE(open_count, 0) + 1 WHERE id = ?').run(row.id);
       }
     }
   }
@@ -2158,10 +2184,10 @@ app.get('/api/track/open/:token.gif', (req, res) => {
 });
 
 // ── Stripe webhook ─────────────────────────────────────────────────────────
-app.post('/api/payments/stripe/webhook', (req, res) => {
-  const stripe = getStripeClient();
+app.post('/api/payments/stripe/webhook', async (req, res) => {
+  const stripe = await getStripeClient();
   if (!stripe) return res.status(503).json({ error: 'Stripe niet geconfigureerd' });
-  const webhookSecret = getStripeWebhookSecret();
+  const webhookSecret = await getStripeWebhookSecret();
 
   let event;
   try {
@@ -2185,7 +2211,7 @@ app.post('/api/payments/stripe/webhook', (req, res) => {
       'checkout.session.async_payment_failed',
       'checkout.session.expired'
     ].includes(type)) {
-      upsertPaymentStatusFromCheckoutEvent(event.data.object, type, event.id);
+      await upsertPaymentStatusFromCheckoutEvent(event.data.object, type, event.id);
     }
     res.json({ received: true });
   } catch (err) {
@@ -2215,20 +2241,20 @@ function parseDbDateToMs(value) {
   return Number.isFinite(t) ? t : null;
 }
 
-app.post('/api/auth/register', registerLimiter, (req, res) => {
+app.post('/api/auth/register', registerLimiter, async (req, res) => {
   const { email, password, firstName, lastName } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Email en wachtwoord verplicht' });
   if (password.length < 6) return res.status(400).json({ error: 'Wachtwoord moet minstens 6 tekens zijn' });
   const normalizedEmail = String(email || '').trim().toLowerCase();
-  const exists = db.prepare('SELECT id FROM users WHERE email = ?').get(normalizedEmail);
+  const exists = await db.prepare('SELECT id FROM users WHERE email = ?').get(normalizedEmail);
   if (exists) return res.status(400).json({ error: 'Email is al geregistreerd' });
   const hash = bcrypt.hashSync(password, 10);
   const token = crypto.randomBytes(32).toString('hex');
   const tokenExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-  db.prepare(`INSERT INTO users(email, password_hash, first_name, last_name, role, status, email_verified, email_verification_token, email_verification_token_expires_at)
+  await db.prepare(`INSERT INTO users(email, password_hash, first_name, last_name, role, status, email_verified, email_verification_token, email_verification_token_expires_at)
               VALUES(?, ?, ?, ?, 'USER', 'ACTIVE', 0, ?, ?)`)
     .run(normalizedEmail, hash, firstName || '', lastName || '', token, tokenExpiry);
-  const verificationUrl = `${getAppBaseUrl()}/api/auth/verify-email?token=${token}`;
+  const verificationUrl = `${await getAppBaseUrl()}/api/auth/verify-email?token=${token}`;
   sendTemplatedEmailSafe('emailVerification', normalizedEmail, {
     verificationUrl,
     customerName: `${firstName || ''} ${lastName || ''}`.trim()
@@ -2236,26 +2262,26 @@ app.post('/api/auth/register', registerLimiter, (req, res) => {
   res.json({ ok: true, message: 'Account aangemaakt! Controleer je e-mail voor een verificatielink.' });
 });
 
-app.get('/api/auth/verify-email', (req, res) => {
+app.get('/api/auth/verify-email', async (req, res) => {
   const token = String(req.query.token || '').trim();
   if (!token) return res.redirect('/login?verified=error');
-  const user = db.prepare('SELECT * FROM users WHERE email_verification_token = ?').get(token);
+  const user = await db.prepare('SELECT * FROM users WHERE email_verification_token = ?').get(token);
   if (!user) return res.redirect('/login?verified=error');
   const expiry = user.email_verification_token_expires_at;
   if (expiry && new Date(expiry) < new Date()) {
     return res.redirect('/login?verified=expired');
   }
-  db.prepare('UPDATE users SET email_verified = 1, email_verification_token = NULL, email_verification_token_expires_at = NULL WHERE id = ?').run(user.id);
+  await db.prepare('UPDATE users SET email_verified = 1, email_verification_token = NULL, email_verification_token_expires_at = NULL WHERE id = ?').run(user.id);
   res.redirect('/login?verified=1');
 });
 
-app.post('/api/auth/login', loginLimiter, (req, res) => {
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
   const { email, password } = req.body || {};
   const rememberRaw = req.body?.remember;
   const remember = rememberRaw === true || rememberRaw === 'true' || rememberRaw === 1 || rememberRaw === '1' || rememberRaw === 'on';
   if (!email || !password) return res.status(400).json({ error: 'Email en wachtwoord verplicht' });
   const normalizedEmail = String(email || '').trim().toLowerCase();
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(normalizedEmail);
+  const user = await db.prepare('SELECT * FROM users WHERE email = ?').get(normalizedEmail);
 
   if (user?.login_locked_until) {
     const lockUntilMs = parseDbDateToMs(user.login_locked_until);
@@ -2266,7 +2292,7 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
         error: `Account tijdelijk vergrendeld na meerdere foutieve pogingen. Probeer opnieuw over ${remainingMin} min (vanaf ${unlockAt}).`
       });
     }
-    db.prepare('UPDATE users SET failed_login_attempts = 0, login_locked_until = NULL WHERE id = ?').run(user.id);
+    await db.prepare('UPDATE users SET failed_login_attempts = 0, login_locked_until = NULL WHERE id = ?').run(user.id);
   }
 
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
@@ -2274,7 +2300,7 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
       const nextAttempts = Number(user.failed_login_attempts || 0) + 1;
       if (nextAttempts >= ACCOUNT_LOCKOUT_MAX_ATTEMPTS) {
         const lockUntilIso = new Date(Date.now() + ACCOUNT_LOCKOUT_MS).toISOString();
-        db.prepare(`UPDATE users
+        await db.prepare(`UPDATE users
                     SET failed_login_attempts = 0,
                         login_locked_until = ?,
                         last_failed_login_at = datetime('now')
@@ -2283,7 +2309,7 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
           error: `Te veel foutieve pogingen. Account vergrendeld tot ${new Date(lockUntilIso).toLocaleString('nl-BE')}.`
         });
       }
-      db.prepare(`UPDATE users
+      await db.prepare(`UPDATE users
                   SET failed_login_attempts = ?,
                       last_failed_login_at = datetime('now')
                   WHERE id = ?`).run(nextAttempts, user.id);
@@ -2304,7 +2330,7 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
       user: { id: user.id, email: user.email, role: user.role, firstName: user.first_name, lastName: user.last_name }
     });
   }
-  db.prepare('UPDATE users SET failed_login_attempts = 0, login_locked_until = NULL, last_login_at = datetime(\'now\') WHERE id = ?').run(user.id);
+  await db.prepare('UPDATE users SET failed_login_attempts = 0, login_locked_until = NULL, last_login_at = datetime(\'now\') WHERE id = ?').run(user.id);
   finalizeAuthenticatedSession(req, user, remember);
   res.json({
     ok: true,
@@ -2314,7 +2340,7 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
   });
 });
 
-app.post('/api/auth/login/2fa', loginLimiter, (req, res) => {
+app.post('/api/auth/login/2fa', loginLimiter, async (req, res) => {
   const pendingUserId = Number(req.session.pending2faUserId || 0);
   const code = String(req.body?.code || '').replace(/\s+/g, '');
   if (!pendingUserId) return res.status(401).json({ error: 'Geen actieve 2FA-login sessie' });
@@ -2327,7 +2353,7 @@ app.post('/api/auth/login/2fa', loginLimiter, (req, res) => {
     return res.status(401).json({ error: '2FA-login sessie verlopen. Log opnieuw in.' });
   }
 
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(pendingUserId);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(pendingUserId);
   if (!user) {
     req.session.pending2faUserId = null;
     req.session.pending2faRemember = null;
@@ -2361,10 +2387,10 @@ app.post('/api/auth/login/2fa', loginLimiter, (req, res) => {
   });
 });
 
-app.post('/api/auth/logout', (req, res) => req.session.destroy(() => res.json({ ok: true })));
+app.post('/api/auth/logout', async (req, res) => req.session.destroy(() => res.json({ ok: true })));
 
-app.get('/api/auth/me', (req, res) => {
-  const u = currentUser(req);
+app.get('/api/auth/me', async (req, res) => {
+  const u = await currentUser(req);
   if (!u) return res.json({ user: null });
   res.json({
     user: {
@@ -2379,14 +2405,14 @@ app.get('/api/auth/me', (req, res) => {
 });
 
 const resendVerificationLimiter = rateLimit({ windowMs: 5 * 60 * 1000, max: 3, standardHeaders: true, legacyHeaders: false });
-app.post('/api/me/resend-verification', requireAuth, resendVerificationLimiter, (req, res) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+app.post('/api/me/resend-verification', requireAuth, resendVerificationLimiter, async (req, res) => {
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
   if (Number(user.email_verified || 0)) return res.json({ ok: true, message: 'E-mail is al geverifieerd.' });
   const token = crypto.randomBytes(32).toString('hex');
   const tokenExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-  db.prepare('UPDATE users SET email_verification_token = ?, email_verification_token_expires_at = ? WHERE id = ?')
+  await db.prepare('UPDATE users SET email_verification_token = ?, email_verification_token_expires_at = ? WHERE id = ?')
     .run(token, tokenExpiry, user.id);
-  const verificationUrl = `${getAppBaseUrl()}/api/auth/verify-email?token=${token}`;
+  const verificationUrl = `${await getAppBaseUrl()}/api/auth/verify-email?token=${token}`;
   sendTemplatedEmailSafe('emailVerification', user.email, {
     verificationUrl,
     customerName: `${user.first_name || ''} ${user.last_name || ''}`.trim()
@@ -2395,18 +2421,18 @@ app.post('/api/me/resend-verification', requireAuth, resendVerificationLimiter, 
 });
 
 // ── Profile ────────────────────────────────────────────────────────────────
-app.put('/api/me/password', requireAuth, (req, res) => {
+app.put('/api/me/password', requireAuth, async (req, res) => {
   const { current, next: nextPw } = req.body || {};
   if (!current || !nextPw || nextPw.length < 6) return res.status(400).json({ error: 'Ongeldig wachtwoord (min 6 tekens)' });
-  const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user.id);
+  const row = await db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user.id);
   if (!bcrypt.compareSync(current, row.password_hash)) return res.status(401).json({ error: 'Huidig wachtwoord onjuist' });
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(nextPw, 10), req.user.id);
+  await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(nextPw, 10), req.user.id);
   res.json({ ok: true });
 });
 
-app.put('/api/me/profile', requireAuth, (req, res) => {
+app.put('/api/me/profile', requireAuth, async (req, res) => {
   const b = req.body || {};
-  db.prepare(`UPDATE users SET first_name=?, last_name=?, address=?, postcode=?, city=?, phone=? WHERE id=?`)
+  await db.prepare(`UPDATE users SET first_name=?, last_name=?, address=?, postcode=?, city=?, phone=? WHERE id=?`)
     .run(
       (b.firstName || '').trim(), (b.lastName || '').trim(),
       (b.address || '').trim(), (b.postcode || '').trim(),
@@ -2416,9 +2442,9 @@ app.put('/api/me/profile', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/me/export-data', requireAuth, (req, res) => {
+app.get('/api/me/export-data', requireAuth, async (req, res) => {
   try {
-    const exportData = loadUserGdprExportData(req.user.id);
+    const exportData = await loadUserGdprExportData(req.user.id);
     if (!exportData) return res.status(404).json({ error: 'Gebruiker niet gevonden' });
 
     const stamp = new Date().toISOString().replace(/[:]/g, '-').replace(/\..+/, 'Z');
@@ -2496,7 +2522,7 @@ app.get('/api/me/export-data', requireAuth, (req, res) => {
   }
 });
 
-app.post('/api/uploads/sign', requireAuth, (req, res) => {
+app.post('/api/uploads/sign', requireAuth, async (req, res) => {
   const normalized = normalizeUploadPath(req.body?.path);
   if (!normalized) return res.status(400).json({ error: 'Ongeldig uploadpad' });
   if (!fs.existsSync(normalized.abs)) return res.status(404).json({ error: 'Bestand niet gevonden' });
@@ -2517,7 +2543,7 @@ app.post('/api/uploads/sign', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/me/2fa/status', requireAuth, (req, res) => {
+app.get('/api/me/2fa/status', requireAuth, async (req, res) => {
   const enabled = !!Number(req.user.totp_enabled || 0);
   const requiredForRole = req.user.role === 'ADMIN';
   res.json({
@@ -2529,7 +2555,7 @@ app.get('/api/me/2fa/status', requireAuth, (req, res) => {
 
 app.post('/api/me/2fa/setup', requireAuth, async (req, res) => {
   try {
-    const existing = db.prepare('SELECT totp_enabled FROM users WHERE id = ?').get(req.user.id);
+    const existing = await db.prepare('SELECT totp_enabled FROM users WHERE id = ?').get(req.user.id);
     if (Number(existing?.totp_enabled || 0)) return res.status(400).json({ error: '2FA staat al aan voor dit account' });
 
     const issuer = 'NEBULOUS';
@@ -2553,7 +2579,7 @@ app.post('/api/me/2fa/setup', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/me/2fa/enable', requireAuth, (req, res) => {
+app.post('/api/me/2fa/enable', requireAuth, async (req, res) => {
   const code = String(req.body?.code || '').replace(/\s+/g, '');
   if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Ongeldige 2FA-code' });
   const secret = String(req.session.pendingTotpSecret || '');
@@ -2567,7 +2593,7 @@ app.post('/api/me/2fa/enable', requireAuth, (req, res) => {
   });
   if (!ok) return res.status(401).json({ error: '2FA-code ongeldig of verlopen' });
 
-  db.prepare(`UPDATE users
+  await db.prepare(`UPDATE users
               SET totp_secret = ?, totp_enabled = 1, totp_enabled_at = datetime('now')
               WHERE id = ?`).run(secret, req.user.id);
   req.session.pendingTotpSecret = null;
@@ -2584,8 +2610,8 @@ app.post('/api/me/2fa/enable', requireAuth, (req, res) => {
   res.json({ ok: true, enabled: true });
 });
 
-app.post('/api/me/2fa/disable', requireAuth, (req, res) => {
-  const fresh = db.prepare('SELECT role, totp_enabled, totp_secret FROM users WHERE id = ?').get(req.user.id);
+app.post('/api/me/2fa/disable', requireAuth, async (req, res) => {
+  const fresh = await db.prepare('SELECT role, totp_enabled, totp_secret FROM users WHERE id = ?').get(req.user.id);
   if (!fresh) return res.status(404).json({ error: 'Gebruiker niet gevonden' });
   if (fresh.role === 'ADMIN') {
     return res.status(403).json({ error: '2FA is verplicht voor admin-accounts en kan niet gedeactiveerd worden.' });
@@ -2605,7 +2631,7 @@ app.post('/api/me/2fa/disable', requireAuth, (req, res) => {
   });
   if (!ok) return res.status(401).json({ error: '2FA-code ongeldig of verlopen' });
 
-  db.prepare(`UPDATE users
+  await db.prepare(`UPDATE users
               SET totp_secret = NULL, totp_enabled = 0, totp_enabled_at = NULL
               WHERE id = ?`).run(req.user.id);
   req.session.pendingTotpSecret = null;
@@ -2623,16 +2649,16 @@ app.post('/api/me/2fa/disable', requireAuth, (req, res) => {
 });
 
 // ── Cart ───────────────────────────────────────────────────────────────────
-function loadCart(userId) {
-  const items = db.prepare(`SELECT * FROM cart_items WHERE user_id = ? ORDER BY id`).all(userId);
-  const designs = db.prepare(`SELECT * FROM cart_item_designs WHERE cart_item_id IN
+async function loadCart(userId) {
+  const items = await db.prepare(`SELECT * FROM cart_items WHERE user_id = ? ORDER BY id`).all(userId);
+  const designs = await db.prepare(`SELECT * FROM cart_item_designs WHERE cart_item_id IN
                               (SELECT id FROM cart_items WHERE user_id = ?)`).all(userId);
   const byItem = {};
   designs.forEach(d => { (byItem[d.cart_item_id] ||= []).push(d); });
   return items.map(i => ({ ...i, designs: byItem[i.id] || [] }));
 }
 
-app.get('/api/cart', requireAuth, (req, res) => {
+app.get('/api/cart', requireAuth, async (req, res) => {
   res.json({ items: loadCart(req.user.id) });
 });
 
@@ -2675,14 +2701,14 @@ app.post('/api/cart', requireAuth, cartUpload.fields([
     return res.status(400).json({ error: 'Design metadata ontbreekt' });
   }
 
-  const cfg = getConfig();
+  const cfg = await getConfig();
   const priced = computeItemPrice({
     ...product,
     designs,
     extraDesigns: Math.max(0, designs.length - 1)
   }, cfg);
   const catalogProduct = priced.product;
-  const result = db.prepare(`
+  const result = await db.prepare(`
     INSERT INTO cart_items(user_id, color_name, color_hex, size, qty, unit_price, extras_price, total, notes,
                            product_type, product_label, product_mockup_path, product_price_multiplier)
     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2711,7 +2737,7 @@ app.post('/api/cart', requireAuth, cartUpload.fields([
     const ext = optimized?.ext || extFromMime(previewFile.mimetype || 'image/png');
     previewPath = path.join('uploads', 'cart', String(itemId), `preview.${ext}`);
     fs.writeFileSync(path.join(ROOT, previewPath), optimized?.buffer || previewFile.buffer);
-    db.prepare('UPDATE cart_items SET preview_path = ? WHERE id = ?').run(previewPath, itemId);
+    await db.prepare('UPDATE cart_items SET preview_path = ? WHERE id = ?').run(previewPath, itemId);
   } else {
     // Legacy JSON fallback (old clients)
     const previewBuf = dataUrlToBuffer(req.body?.previewDataUrl);
@@ -2720,11 +2746,11 @@ app.post('/api/cart', requireAuth, cartUpload.fields([
       const ext = optimized?.ext || extFromMime(previewBuf.mime || 'image/png');
       previewPath = path.join('uploads', 'cart', String(itemId), `preview.${ext}`);
       fs.writeFileSync(path.join(ROOT, previewPath), optimized?.buffer || previewBuf.buffer);
-      db.prepare('UPDATE cart_items SET preview_path = ? WHERE id = ?').run(previewPath, itemId);
+      await db.prepare('UPDATE cart_items SET preview_path = ? WHERE id = ?').run(previewPath, itemId);
     }
   }
 
-  const insertDesign = db.prepare(`
+  const insertDesign = await db.prepare(`
     INSERT INTO cart_item_designs(cart_item_id, name, position, scale, v_offset, x_offset, note, file_path)
     VALUES(?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -2760,11 +2786,11 @@ app.post('/api/cart', requireAuth, cartUpload.fields([
       Number(d.scale) || 100, Number(d.vOffset) || 0, Number(d.xOffset) || 0, d.note || '', filePath);
   }
 
-  res.json({ ok: true, itemId, count: db.prepare('SELECT COUNT(*) AS c FROM cart_items WHERE user_id = ?').get(req.user.id).c });
+  res.json({ ok: true, itemId, count: (await db.prepare('SELECT COUNT(*) AS c FROM cart_items WHERE user_id = ?').get(req.user.id)).c });
   } catch (err) {
     if (createdItemId) {
-      db.prepare('DELETE FROM cart_item_designs WHERE cart_item_id = ?').run(createdItemId);
-      db.prepare('DELETE FROM cart_items WHERE id = ?').run(createdItemId);
+      await db.prepare('DELETE FROM cart_item_designs WHERE cart_item_id = ?').run(createdItemId);
+      await db.prepare('DELETE FROM cart_items WHERE id = ?').run(createdItemId);
     }
     if (createdDir) {
       fs.rmSync(createdDir, { recursive: true, force: true });
@@ -2776,34 +2802,34 @@ app.post('/api/cart', requireAuth, cartUpload.fields([
   }
 });
 
-app.put('/api/cart/:id', requireAuth, (req, res) => {
+app.put('/api/cart/:id', requireAuth, async (req, res) => {
   const id = Number(req.params.id);
-  const item = db.prepare('SELECT * FROM cart_items WHERE id = ? AND user_id = ?').get(id, req.user.id);
+  const item = await db.prepare('SELECT * FROM cart_items WHERE id = ? AND user_id = ?').get(id, req.user.id);
   if (!item) return res.status(404).json({ error: 'Item niet gevonden' });
   const qty = Math.max(1, Math.min(99, Number(req.body?.qty) || item.qty));
   const total = roundMoney((Number(item.unit_price) + Number(item.extras_price)) * qty);
-  db.prepare('UPDATE cart_items SET qty = ?, total = ? WHERE id = ?').run(qty, total, id);
+  await db.prepare('UPDATE cart_items SET qty = ?, total = ? WHERE id = ?').run(qty, total, id);
   res.json({ ok: true });
 });
 
-app.delete('/api/cart/:id', requireAuth, (req, res) => {
+app.delete('/api/cart/:id', requireAuth, async (req, res) => {
   const id = Number(req.params.id);
-  const item = db.prepare('SELECT * FROM cart_items WHERE id = ? AND user_id = ?').get(id, req.user.id);
+  const item = await db.prepare('SELECT * FROM cart_items WHERE id = ? AND user_id = ?').get(id, req.user.id);
   if (!item) return res.status(404).json({ error: 'Item niet gevonden' });
-  db.prepare('DELETE FROM cart_items WHERE id = ?').run(id);
+  await db.prepare('DELETE FROM cart_items WHERE id = ?').run(id);
   fs.rmSync(path.join(CART_DIR, String(id)), { recursive: true, force: true });
   res.json({ ok: true });
 });
 
-app.delete('/api/cart', requireAuth, (req, res) => {
-  const items = db.prepare('SELECT id FROM cart_items WHERE user_id = ?').all(req.user.id);
-  db.prepare('DELETE FROM cart_items WHERE user_id = ?').run(req.user.id);
+app.delete('/api/cart', requireAuth, async (req, res) => {
+  const items = await db.prepare('SELECT id FROM cart_items WHERE user_id = ?').all(req.user.id);
+  await db.prepare('DELETE FROM cart_items WHERE user_id = ?').run(req.user.id);
   items.forEach(i => fs.rmSync(path.join(CART_DIR, String(i.id)), { recursive: true, force: true }));
   res.json({ ok: true });
 });
 
 // ── Checkout (cart → order) ────────────────────────────────────────────────
-app.post('/api/orders', requireAuth, (req, res) => {
+app.post('/api/orders', requireAuth, async (req, res) => {
   if (!Number(req.user.email_verified || 0)) {
     return res.status(403).json({
       error: 'Verifieer eerst je e-mailadres voordat je een bestelling kunt plaatsen. Controleer je inbox of stuur een nieuwe verificatiemail via je accountinstellingen.',
@@ -2830,83 +2856,81 @@ app.post('/api/orders', requireAuth, (req, res) => {
   });
 
   const subtotal = pricedCart.reduce((s, i) => s + (i.total || 0), 0);
-  const shipping = computeShippingAmount(subtotal, getConfig()?.pricing || {});
+  const cfgForShipping = await getConfig();
+  const shipping = computeShippingAmount(subtotal, cfgForShipping?.pricing || {});
   const total = subtotal + shipping;
   const customerCompany = String(customer.company || '').trim().slice(0, 120);
   const customerVat = String(customer.vatNumber || '').trim().slice(0, 40);
 
-  let orderId;
-  const tx = db.transaction(() => {
-    const r = db.prepare(`
-      INSERT INTO orders(user_id, status, customer_first, customer_last, customer_email,
-                         customer_company, customer_vat, address, postcode, city, phone, subtotal, total, notes)
-      VALUES(?, 'NEW', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(req.user.id, customer.firstName.trim(), customer.lastName.trim(), customer.email.trim(),
-      customerCompany || null, customerVat || null,
-      customer.address.trim(), customer.postcode.trim(), customer.city.trim(),
-      (customer.phone || '').trim(), subtotal, total, notes || '');
-    orderId = r.lastInsertRowid;
+  // Create order (sequential async — works for both SQLite and PG)
+  const r = await db.prepare(`
+    INSERT INTO orders(user_id, status, customer_first, customer_last, customer_email,
+                       customer_company, customer_vat, address, postcode, city, phone, subtotal, total, notes)
+    VALUES(?, 'NEW', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(req.user.id, customer.firstName.trim(), customer.lastName.trim(), customer.email.trim(),
+    customerCompany || null, customerVat || null,
+    customer.address.trim(), customer.postcode.trim(), customer.city.trim(),
+    (customer.phone || '').trim(), subtotal, total, notes || '');
+  const orderId = r.lastInsertRowid;
 
-    db.prepare(`INSERT INTO order_status_history(order_id, status, note, changed_by)
-                VALUES(?, 'NEW', 'Bestelling geplaatst', ?)`).run(orderId, req.user.id);
+  await db.prepare(`INSERT INTO order_status_history(order_id, status, note, changed_by)
+              VALUES(?, 'NEW', 'Bestelling geplaatst', ?)`).run(orderId, req.user.id);
 
-    const insItem = db.prepare(`
+  for (const item of pricedCart) {
+    const r2 = await db.prepare(`
       INSERT INTO order_items(order_id, color_name, color_hex, size, qty, unit_price, extras_price, total, preview_path, notes,
                               product_type, product_label, product_mockup_path, product_price_multiplier)
       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const insDesign = db.prepare(`
-      INSERT INTO order_designs(order_item_id, name, position, scale, v_offset, x_offset, note, file_path)
-      VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    `).run(orderId, item.color_name, item.color_hex, item.size, item.qty,
+      item.unit_price, item.extras_price, item.total, null, item.notes || '',
+      item.product_type || 'tshirt',
+      item.product_label || 'T-shirt',
+      item.product_mockup_path || null,
+      Number(item.product_price_multiplier) || 1);
+    const itemId = r2.lastInsertRowid;
 
-    pricedCart.forEach(item => {
-      const r2 = insItem.run(orderId, item.color_name, item.color_hex, item.size, item.qty,
-        item.unit_price, item.extras_price, item.total, null, item.notes || '',
-        item.product_type || 'tshirt',
-        item.product_label || 'T-shirt',
-        item.product_mockup_path || null,
-        Number(item.product_price_multiplier) || 1);
-      const itemId = r2.lastInsertRowid;
+    // Move preview (only in non-PG mode where filesystem is persistent)
+    let newPreview = null;
+    if (!USE_PG && item.preview_path) {
       const orderItemDir = path.join(ORDER_DIR, String(orderId), String(itemId));
       fs.mkdirSync(orderItemDir, { recursive: true });
+      const src = path.join(ROOT, item.preview_path);
+      if (fs.existsSync(src)) {
+        const ext = path.extname(item.preview_path) || '.png';
+        newPreview = path.join('uploads', 'orders', String(orderId), String(itemId), `preview${ext}`);
+        fs.renameSync(src, path.join(ROOT, newPreview));
+      }
+    }
+    if (newPreview) await db.prepare('UPDATE order_items SET preview_path = ? WHERE id = ?').run(newPreview, itemId);
 
-      // Move preview
-      let newPreview = null;
-      if (item.preview_path) {
-        const src = path.join(ROOT, item.preview_path);
+    for (let i = 0; i < item.designs.length; i++) {
+      const d = item.designs[i];
+      let newFile = null;
+      if (!USE_PG && d.file_path) {
+        const orderItemDir = path.join(ORDER_DIR, String(orderId), String(itemId));
+        fs.mkdirSync(orderItemDir, { recursive: true });
+        const src = path.join(ROOT, d.file_path);
         if (fs.existsSync(src)) {
-          const ext = path.extname(item.preview_path) || '.png';
-          newPreview = path.join('uploads', 'orders', String(orderId), String(itemId), `preview${ext}`);
-          fs.renameSync(src, path.join(ROOT, newPreview));
+          const ext = path.extname(d.file_path) || '.png';
+          newFile = path.join('uploads', 'orders', String(orderId), String(itemId), `design-${i + 1}${ext}`);
+          fs.renameSync(src, path.join(ROOT, newFile));
         }
       }
-      if (newPreview) db.prepare('UPDATE order_items SET preview_path = ? WHERE id = ?').run(newPreview, itemId);
+      await db.prepare(`INSERT INTO order_designs(order_item_id, name, position, scale, v_offset, x_offset, note, file_path)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?)`).run(itemId, d.name, d.position, d.scale, d.v_offset, d.x_offset, d.note || '', newFile || d.file_path);
+    }
 
-      item.designs.forEach((d, i) => {
-        let newFile = null;
-        if (d.file_path) {
-          const src = path.join(ROOT, d.file_path);
-          if (fs.existsSync(src)) {
-            const ext = path.extname(d.file_path) || '.png';
-            newFile = path.join('uploads', 'orders', String(orderId), String(itemId), `design-${i + 1}${ext}`);
-            fs.renameSync(src, path.join(ROOT, newFile));
-          }
-        }
-        insDesign.run(itemId, d.name, d.position, d.scale, d.v_offset, d.x_offset, d.note || '', newFile);
-      });
+    // Cleanup leftover cart dir
+    if (!USE_PG) {
+      try { fs.rmSync(path.join(CART_DIR, String(item.id)), { recursive: true, force: true }); } catch {}
+    }
+  }
 
-      // Cleanup leftover cart dir
-      fs.rmSync(path.join(CART_DIR, String(item.id)), { recursive: true, force: true });
-    });
-
-    db.prepare('DELETE FROM cart_items WHERE user_id = ?').run(req.user.id);
-  });
-  tx();
-  ensureInvoiceForOrder(orderId, getConfig());
+  await db.prepare('DELETE FROM cart_items WHERE user_id = ?').run(req.user.id);
+  await ensureInvoiceForOrder(orderId, await getConfig());
 
   if (saveAddress) {
-    db.prepare(`UPDATE users SET first_name=COALESCE(NULLIF(first_name,''),?),
+    await db.prepare(`UPDATE users SET first_name=COALESCE(NULLIF(first_name,''),?),
                                   last_name=COALESCE(NULLIF(last_name,''),?),
                                   address=?, postcode=?, city=?, phone=?
                 WHERE id=?`)
@@ -2926,21 +2950,21 @@ app.post('/api/orders', requireAuth, (req, res) => {
 });
 
 // ── Orders (user + staff) ──────────────────────────────────────────────────
-app.get('/api/orders/mine', requireAuth, (req, res) => {
-  const rows = db.prepare(`SELECT id, status, subtotal, total, created_at FROM orders
+app.get('/api/orders/mine', requireAuth, async (req, res) => {
+  const rows = await db.prepare(`SELECT id, status, subtotal, total, created_at FROM orders
                            WHERE user_id = ? AND deleted_at IS NULL ORDER BY id DESC`).all(req.user.id);
   const orderIds = rows.map(r => r.id);
   if (orderIds.length) {
-    backfillMissingInvoices(getConfig(), 400);
+    await backfillMissingInvoices(await getConfig(), 400);
   }
   const placeholders = orderIds.map(() => '?').join(',');
   const invoices = orderIds.length
-    ? db.prepare(`SELECT order_id, status, due_date, paid_at, invoice_number
+    ? await db.prepare(`SELECT order_id, status, due_date, paid_at, invoice_number
                   FROM invoices WHERE order_id IN (${placeholders})`).all(...orderIds)
     : [];
   const invoiceByOrder = {};
   invoices.forEach((inv) => { invoiceByOrder[inv.order_id] = inv; });
-  const items = db.prepare(`SELECT order_id, id, color_name, color_hex, size, qty, total, preview_path, product_label
+  const items = await db.prepare(`SELECT order_id, id, color_name, color_hex, size, qty, total, preview_path, product_label
                             FROM order_items WHERE order_id IN
                             (SELECT id FROM orders WHERE user_id = ?)`).all(req.user.id);
   const byOrder = {};
@@ -2958,44 +2982,44 @@ app.get('/api/orders/mine', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/orders/:id', requireAuth, (req, res) => {
+app.get('/api/orders/:id', requireAuth, async (req, res) => {
   const id = Number(req.params.id);
-  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+  const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
   if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
   const isStaff = req.user.role === 'OWNER' || req.user.role === 'ADMIN';
   if (!isStaff && (order.user_id !== req.user.id || isOrderArchived(order))) {
     return res.status(403).json({ error: 'Geen toegang' });
   }
   if (isOrderArchived(order) && !isStaff) return res.status(404).json({ error: 'Order niet gevonden' });
-  ensureInvoiceForOrder(id, getConfig());
-  const invoice = db.prepare(`SELECT id, order_id, invoice_number, status, issue_date, due_date, paid_at, sent_at, last_reminder_at, reminder_count
+  await ensureInvoiceForOrder(id, await getConfig());
+  const invoice = await db.prepare(`SELECT id, order_id, invoice_number, status, issue_date, due_date, paid_at, sent_at, last_reminder_at, reminder_count
                               FROM invoices WHERE order_id = ?`).get(id) || null;
   const invoicePayload = invoice
     ? { ...invoice, overdue: !!(invoice.status === 'DEFINITIVE' && !invoice.paid_at && invoice.due_date && new Date(invoice.due_date).getTime() <= Date.now()) }
     : null;
-  const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(id);
-  const designs = db.prepare(`SELECT * FROM order_designs WHERE order_item_id IN
+  const items = await db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(id);
+  const designs = await db.prepare(`SELECT * FROM order_designs WHERE order_item_id IN
                               (SELECT id FROM order_items WHERE order_id = ?)`).all(id);
   const byItem = {};
   designs.forEach(d => { (byItem[d.order_item_id] ||= []).push(d); });
-  const history = db.prepare(`SELECT h.*, u.email AS changed_by_email FROM order_status_history h
+  const history = await db.prepare(`SELECT h.*, u.email AS changed_by_email FROM order_status_history h
                               LEFT JOIN users u ON u.id = h.changed_by
                               WHERE order_id = ? ORDER BY h.id`).all(id);
-  const payments = db.prepare(`SELECT id, provider, status, amount, currency, checkout_url,
+  const payments = await db.prepare(`SELECT id, provider, status, amount, currency, checkout_url,
                                       provider_payment_id, provider_checkout_id, payment_link_expires_at,
                                       paid_at, failure_reason, created_at, updated_at
                                FROM payments WHERE order_id = ?
                                ORDER BY id DESC`).all(id);
   const emailTracking = isStaff ? getEmailTrackingForOrder(id) : [];
   const depositInvoices = isStaff
-    ? db.prepare(`SELECT id, order_id, linked_final_invoice_id, invoice_number, status, deposit_percentage, deposit_amount,
+    ? await db.prepare(`SELECT id, order_id, linked_final_invoice_id, invoice_number, status, deposit_percentage, deposit_amount,
                          issue_date, due_date, sent_at, paid_at, created_at, updated_at
                   FROM deposit_invoices
                   WHERE order_id = ?
                   ORDER BY id DESC`).all(id)
     : [];
   const shippingEvents = isStaff
-    ? db.prepare(`SELECT id, event_key, carrier, status_raw, status_normalized, tracking_code, event_at, created_at
+    ? await db.prepare(`SELECT id, event_key, carrier, status_raw, status_normalized, tracking_code, event_at, created_at
                   FROM shipping_events WHERE order_id = ? ORDER BY id DESC LIMIT 50`).all(id)
     : [];
   const activityFeed = isStaff ? buildOrderActivityFeed(order, history, emailTracking, depositInvoices, payments, shippingEvents) : [];
@@ -3012,26 +3036,26 @@ app.get('/api/orders/:id', requireAuth, (req, res) => {
   });
 });
 
-app.put('/api/orders/:id/cancel', requireAuth, (req, res) => {
+app.put('/api/orders/:id/cancel', requireAuth, async (req, res) => {
   const id = Number(req.params.id);
-  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+  const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
   if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
   if (isOrderArchived(order)) return res.status(400).json({ error: 'Deze bestelling is gearchiveerd' });
   if (order.user_id !== req.user.id) return res.status(403).json({ error: 'Geen toegang' });
   if (!CUSTOMER_CANCELLABLE_STATUS.includes(order.status)) {
     return res.status(400).json({ error: 'Deze bestelling kan niet meer geannuleerd worden' });
   }
-  db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('CANCELLED', id);
-  db.prepare(`INSERT INTO order_status_history(order_id, status, note, changed_by)
+  await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('CANCELLED', id);
+  await db.prepare(`INSERT INTO order_status_history(order_id, status, note, changed_by)
               VALUES(?, 'CANCELLED', 'Geannuleerd door klant', ?)`).run(id, req.user.id);
   markInvoiceVoid(id);
   res.json({ ok: true });
 });
 
 // ── Staff ─────────────────────────────────────────────────────────────────
-app.get('/api/admin/orders', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.get('/api/admin/orders', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   processInvoiceRemindersSafe(false).catch(() => {});
-  backfillMissingInvoices(getConfig(), 400);
+  await backfillMissingInvoices(await getConfig(), 400);
   const page = Math.max(1, Number(req.query.page) || 1);
   const limit = Math.min(100, Math.max(5, Number(req.query.limit) || 20));
   const offset = (page - 1) * limit;
@@ -3061,13 +3085,14 @@ app.get('/api/admin/orders', requireAuth, requireRole('ADMIN', 'OWNER'), (req, r
     params.q = `%${q}%`;
   }
 
-  const total = db.prepare(`
+  const totalRow = await db.prepare(`
     SELECT COUNT(*) AS c
     FROM orders o
     LEFT JOIN invoices i ON i.order_id = o.id
     WHERE ${where}
-  `).get(params).c;
-  const rows = db.prepare(`
+  `).get(params);
+  const total = totalRow?.c || 0;
+  const rows = await db.prepare(`
     SELECT o.id, o.status, o.subtotal, o.total, o.created_at,
            o.deleted_at, o.deleted_by, o.delete_reason,
            o.shipping_carrier, o.tracking_code, o.tracking_url, o.shipping_status, o.shipping_last_update_at,
@@ -3086,7 +3111,7 @@ app.get('/api/admin/orders', requireAuth, requireRole('ADMIN', 'OWNER'), (req, r
     LIMIT ${limit} OFFSET ${offset}
   `).all(params);
 
-  const stats = db.prepare(`SELECT
+  const stats = await db.prepare(`SELECT
     COUNT(*) AS total_orders,
     SUM(CASE WHEN status='NEW' AND deleted_at IS NULL THEN 1 ELSE 0 END) AS new_count,
     SUM(CASE WHEN status IN ('NEW','APPROVED','APPROVED_AWAITING_PAYMENT','PAYMENT_PENDING','PAID','IN_PRODUCTION') AND deleted_at IS NULL THEN 1 ELSE 0 END) AS open_count,
@@ -3131,8 +3156,8 @@ function invoiceSortOrderSql(raw) {
 }
 
 app.get('/api/admin/invoices', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
-  const cfg = getConfig();
-  backfillMissingInvoices(cfg, 400);
+  const cfg = await getConfig();
+  await backfillMissingInvoices(cfg, 400);
   await processInvoiceRemindersSafe(false);
   const page = Math.max(1, Number(req.query.page) || 1);
   const limit = Math.min(100, Math.max(10, Number(req.query.limit) || 20));
@@ -3144,14 +3169,15 @@ app.get('/api/admin/invoices', requireAuth, requireRole('ADMIN', 'OWNER'), async
   const where = buildInvoiceWhereClause(statusFilter, q, params);
   const orderBy = invoiceSortOrderSql(sort);
 
-  const total = db.prepare(`
+  const invTotalRow = await db.prepare(`
     SELECT COUNT(*) AS c
     FROM invoices i
     JOIN orders o ON o.id = i.order_id
     WHERE ${where}
-  `).get(params).c;
+  `).get(params);
+  const total = invTotalRow?.c || 0;
 
-  const rows = db.prepare(`
+  const rows = await db.prepare(`
     SELECT i.id, i.order_id, i.invoice_number, i.status, i.issue_date, i.due_date, i.paid_at, i.sent_at,
            i.last_reminder_at, i.reminder_count,
            o.customer_first, o.customer_last, o.customer_email, o.total, o.status AS order_status,
@@ -3166,7 +3192,7 @@ app.get('/api/admin/invoices', requireAuth, requireRole('ADMIN', 'OWNER'), async
     LIMIT ${limit} OFFSET ${offset}
   `).all(params);
 
-  const stats = db.prepare(`
+  const stats = await db.prepare(`
     SELECT
       COUNT(*) AS total_invoices,
       SUM(CASE WHEN status='CONCEPT' THEN 1 ELSE 0 END) AS concept_count,
@@ -3181,14 +3207,14 @@ app.get('/api/admin/invoices', requireAuth, requireRole('ADMIN', 'OWNER'), async
   res.json({ invoices: rows, total, page, limit, pages: Math.max(1, Math.ceil(total / limit)), stats, sort, status: statusFilter || 'ALL' });
 });
 
-app.get('/api/admin/invoices.csv', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.get('/api/admin/invoices.csv', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   const statusFilter = normalizeInvoiceStatusFilter(req.query.status);
   const sort = String(req.query.sort || 'DUE_ASC').toUpperCase();
   const q = String(req.query.q || '').trim();
   const params = {};
   const where = buildInvoiceWhereClause(statusFilter, q, params);
   const orderBy = invoiceSortOrderSql(sort);
-  const rows = db.prepare(`
+  const rows = await db.prepare(`
     SELECT i.invoice_number, i.status, i.issue_date, i.due_date, i.paid_at, i.sent_at, i.last_reminder_at, i.reminder_count,
            i.order_id, o.customer_first, o.customer_last, o.customer_email, o.total
     FROM invoices i
@@ -3222,11 +3248,11 @@ app.post('/api/admin/invoices/remind-bulk', requireAuth, requireRole('ADMIN', 'O
     const ids = [...new Set(inputIds.map(v => Number(v)).filter(v => Number.isInteger(v) && v > 0))];
     if (!ids.length) return res.status(400).json({ error: 'Selecteer minstens 1 factuur' });
     if (ids.length > 200) return res.status(400).json({ error: 'Maximaal 200 facturen per bulkactie' });
-    const cfg = getConfig();
+    const cfg = await getConfig();
     const maxCount = Math.min(20, Math.max(1, Number(cfg?.documents?.invoice?.reminderMaxCount) || 5));
 
     const placeholders = ids.map(() => '?').join(',');
-    const rows = db.prepare(`
+    const rows = await db.prepare(`
       SELECT i.*, o.customer_email, o.customer_first, o.customer_last, o.total,
              (SELECT checkout_url FROM payments p WHERE p.order_id = o.id AND p.checkout_url IS NOT NULL
               ORDER BY p.id DESC LIMIT 1) AS checkout_url
@@ -3293,7 +3319,7 @@ app.post('/api/admin/invoices/:id/resend', requireAuth, requireRole('ADMIN', 'OW
   try {
     const invoiceId = Number(req.params.id);
     if (!Number.isInteger(invoiceId) || invoiceId <= 0) return res.status(400).json({ error: 'Ongeldige factuur' });
-    const row = db.prepare(`
+    const row = await db.prepare(`
       SELECT i.id, i.order_id, i.invoice_number,
              o.customer_email, o.customer_first, o.customer_last, o.total
       FROM invoices i
@@ -3302,10 +3328,10 @@ app.post('/api/admin/invoices/:id/resend', requireAuth, requireRole('ADMIN', 'OW
     `).get(invoiceId);
     if (!row) return res.status(404).json({ error: 'Factuur niet gevonden' });
     if (!row.customer_email) return res.status(400).json({ error: 'Geen klant e-mail beschikbaar' });
-    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(row.order_id);
+    const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(row.order_id);
     if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
     if (isOrderArchived(order)) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
-    const payment = db.prepare(`SELECT checkout_url, payment_link_expires_at FROM payments
+    const payment = await db.prepare(`SELECT checkout_url, payment_link_expires_at FROM payments
                                 WHERE order_id = ? AND checkout_url IS NOT NULL
                                 ORDER BY id DESC LIMIT 1`).get(order.id) || null;
     const info = await sendPaymentLinkEmailWithInvoice(order, payment, {
@@ -3313,7 +3339,7 @@ app.post('/api/admin/invoices/:id/resend', requireAuth, requireRole('ADMIN', 'OW
       actorEmail: req.user?.email || null
     });
     if (info?.ok) {
-      db.prepare(`UPDATE invoices SET sent_at = ? WHERE id = ?`).run(new Date().toISOString(), invoiceId);
+      await db.prepare(`UPDATE invoices SET sent_at = ? WHERE id = ?`).run(new Date().toISOString(), invoiceId);
     }
     res.json({ ok: true, info });
   } catch (err) {
@@ -3322,21 +3348,21 @@ app.post('/api/admin/invoices/:id/resend', requireAuth, requireRole('ADMIN', 'OW
   }
 });
 
-app.put('/api/admin/orders/:id/status', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.put('/api/admin/orders/:id/status', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   const status = String(req.body?.status || '').toUpperCase();
   const note = (req.body?.note || '').trim();
   if (!ALLOWED_STATUS.includes(status)) return res.status(400).json({ error: 'Ongeldige status' });
   const id = Number(req.params.id);
-  const cur = db.prepare('SELECT status, customer_email, customer_first, customer_last, total, deleted_at FROM orders WHERE id = ?').get(id);
+  const cur = await db.prepare('SELECT status, customer_email, customer_first, customer_last, total, deleted_at FROM orders WHERE id = ?').get(id);
   if (!cur) return res.status(404).json({ error: 'Order niet gevonden' });
   if (cur.deleted_at) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
   if (cur.status === status) return res.json({ ok: true });
-  db.prepare('UPDATE orders SET status = ? WHERE id = ?').run(status, id);
-  db.prepare(`INSERT INTO order_status_history(order_id, status, note, changed_by)
+  await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run(status, id);
+  await db.prepare(`INSERT INTO order_status_history(order_id, status, note, changed_by)
               VALUES(?, ?, ?, ?)`).run(id, status, note, req.user.id);
   if (status === 'PAID') markInvoicePaid(id);
   else if (status === 'CANCELLED') markInvoiceVoid(id);
-  else if (status === 'APPROVED_AWAITING_PAYMENT' || status === 'PAYMENT_PENDING') finalizeInvoiceForOrder(id, getConfig());
+  else if (status === 'APPROVED_AWAITING_PAYMENT' || status === 'PAYMENT_PENDING') finalizeInvoiceForOrder(id, await getConfig());
 
   logAuditFromReq(req, {
     action: 'ORDER_STATUS_UPDATED',
@@ -3347,7 +3373,7 @@ app.put('/api/admin/orders/:id/status', requireAuth, requireRole('ADMIN', 'OWNER
   });
   if (cur.customer_email) {
     if (status === 'PAID') {
-      sendPaymentReceivedEmailWithInvoiceSafe({
+      await sendPaymentReceivedEmailWithInvoiceSafe({
         id,
         customer_email: cur.customer_email,
         customer_first: cur.customer_first,
@@ -3367,14 +3393,14 @@ app.put('/api/admin/orders/:id/status', requireAuth, requireRole('ADMIN', 'OWNER
 });
 
 // Order klantgegevens bewerken
-app.put('/api/admin/orders/:id/customer', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.put('/api/admin/orders/:id/customer', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   const id = Number(req.params.id);
-  const order = db.prepare('SELECT id, deleted_at FROM orders WHERE id = ?').get(id);
+  const order = await db.prepare('SELECT id, deleted_at FROM orders WHERE id = ?').get(id);
   if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
   if (order.deleted_at) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
   const b = req.body || {};
   const clean = (v, max = 160) => String(v == null ? '' : v).trim().slice(0, max);
-  db.prepare(`UPDATE orders SET
+  await db.prepare(`UPDATE orders SET
     customer_first=?, customer_last=?, customer_email=?, customer_company=?, customer_vat=?,
     address=?, postcode=?, city=?, phone=?
     WHERE id=?`).run(
@@ -3387,15 +3413,15 @@ app.put('/api/admin/orders/:id/customer', requireAuth, requireRole('ADMIN', 'OWN
   res.json({ ok: true });
 });
 
-function handleSoftDeleteOrder(req, res) {
+async function handleSoftDeleteOrder(req, res) {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Ongeldige order' });
 
-  const order = db.prepare('SELECT id, status, customer_email, deleted_at FROM orders WHERE id = ?').get(id);
+  const order = await db.prepare('SELECT id, status, customer_email, deleted_at FROM orders WHERE id = ?').get(id);
   if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
   if (order.deleted_at) return res.json({ ok: true, archived: true, orderId: id, alreadyArchived: true });
   const reason = String(req.body?.reason || 'Gearchiveerd via admin').trim().slice(0, 240);
-  db.prepare(`UPDATE orders
+  await db.prepare(`UPDATE orders
               SET deleted_at = ?, deleted_by = ?, delete_reason = ?
               WHERE id = ?`)
     .run(new Date().toISOString(), req.user.id, reason, id);
@@ -3422,9 +3448,9 @@ app.delete('/api/admin/orders/:id', requireAuth, requireRole('ADMIN', 'OWNER'), 
 app.post('/api/admin/orders/:id/delete', requireAuth, requireRole('ADMIN', 'OWNER'), handleSoftDeleteOrder);
 
 // Order-item bewerken
-app.put('/api/admin/order-items/:id', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.put('/api/admin/order-items/:id', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   const id = Number(req.params.id);
-  const item = db.prepare(`
+  const item = await db.prepare(`
     SELECT oi.id, o.deleted_at
     FROM order_items oi
     JOIN orders o ON o.id = oi.order_id
@@ -3435,15 +3461,15 @@ app.put('/api/admin/order-items/:id', requireAuth, requireRole('ADMIN', 'OWNER')
   const b = req.body || {};
   if (b.qty !== undefined) {
     const qty = Math.max(1, Math.min(9999, Number(b.qty) || 1));
-    db.prepare('UPDATE order_items SET qty = ? WHERE id = ?').run(qty, id);
+    await db.prepare('UPDATE order_items SET qty = ? WHERE id = ?').run(qty, id);
   }
   if (b.notes !== undefined) {
-    db.prepare('UPDATE order_items SET notes = ? WHERE id = ?').run(String(b.notes || '').trim().slice(0, 500), id);
+    await db.prepare('UPDATE order_items SET notes = ? WHERE id = ?').run(String(b.notes || '').trim().slice(0, 500), id);
   }
   res.json({ ok: true });
 });
 
-app.put('/api/admin/orders/bulk-status', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.put('/api/admin/orders/bulk-status', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   const status = String(req.body?.status || '').toUpperCase();
   const note = (req.body?.note || '').trim();
   const inputIds = Array.isArray(req.body?.orderIds) ? req.body.orderIds : [];
@@ -3454,7 +3480,7 @@ app.put('/api/admin/orders/bulk-status', requireAuth, requireRole('ADMIN', 'OWNE
   if (ids.length > 200) return res.status(400).json({ error: 'Maximaal 200 orders per bulkactie' });
 
   const placeholders = ids.map(() => '?').join(',');
-  const rows = db.prepare(`
+  const rows = await db.prepare(`
     SELECT id, status, customer_email, customer_first, customer_last, total, deleted_at
     FROM orders
     WHERE id IN (${placeholders})
@@ -3466,32 +3492,23 @@ app.put('/api/admin/orders/bulk-status', requireAuth, requireRole('ADMIN', 'OWNE
   let changed = 0;
   let skipped = 0;
 
-  const tx = db.transaction(() => {
-    for (const row of rows) {
-      if (row.deleted_at) {
-        skipped++;
-        continue;
-      }
-      if (row.status === status) {
-        skipped++;
-        continue;
-      }
-      db.prepare('UPDATE orders SET status = ? WHERE id = ?').run(status, row.id);
-      db.prepare(`INSERT INTO order_status_history(order_id, status, note, changed_by)
-                  VALUES(?, ?, ?, ?)`).run(row.id, status, note, req.user.id);
-      if (status === 'PAID') markInvoicePaid(row.id);
-      else if (status === 'CANCELLED') markInvoiceVoid(row.id);
-      else if (status === 'APPROVED_AWAITING_PAYMENT' || status === 'PAYMENT_PENDING') finalizeInvoiceForOrder(row.id, getConfig());
-      changed++;
-      toNotify.push(row);
-    }
-  });
-  tx();
+  for (const row of rows) {
+    if (row.deleted_at) { skipped++; continue; }
+    if (row.status === status) { skipped++; continue; }
+    await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run(status, row.id);
+    await db.prepare(`INSERT INTO order_status_history(order_id, status, note, changed_by)
+                VALUES(?, ?, ?, ?)`).run(row.id, status, note, req.user.id);
+    if (status === 'PAID') await markInvoicePaid(row.id);
+    else if (status === 'CANCELLED') await markInvoiceVoid(row.id);
+    else if (status === 'APPROVED_AWAITING_PAYMENT' || status === 'PAYMENT_PENDING') await finalizeInvoiceForOrder(row.id, await getConfig());
+    changed++;
+    toNotify.push(row);
+  }
 
   for (const row of toNotify) {
     if (!row.customer_email) continue;
     if (status === 'PAID') {
-      sendPaymentReceivedEmailWithInvoiceSafe({
+      await sendPaymentReceivedEmailWithInvoiceSafe({
         id: row.id,
         customer_email: row.customer_email,
         customer_first: row.customer_first,
@@ -3535,31 +3552,25 @@ app.put('/api/admin/orders/bulk-status', requireAuth, requireRole('ADMIN', 'OWNE
   });
 });
 
-function handleBulkSoftDeleteOrders(req, res) {
+async function handleBulkSoftDeleteOrders(req, res) {
   const inputIds = Array.isArray(req.body?.orderIds) ? req.body.orderIds : [];
   const reason = String(req.body?.reason || 'Bulk gearchiveerd via admin').trim().slice(0, 240);
   const ids = [...new Set(inputIds.map(v => Number(v)).filter(v => Number.isInteger(v) && v > 0))];
   if (!ids.length) return res.status(400).json({ error: 'Selecteer minstens 1 order' });
   if (ids.length > 200) return res.status(400).json({ error: 'Maximaal 200 orders per bulkactie' });
   const placeholders = ids.map(() => '?').join(',');
-  const rows = db.prepare(`SELECT id, deleted_at FROM orders WHERE id IN (${placeholders})`).all(...ids);
+  const rows = await db.prepare(`SELECT id, deleted_at FROM orders WHERE id IN (${placeholders})`).all(...ids);
   const foundSet = new Set(rows.map(r => r.id));
   const missing = ids.filter(id => !foundSet.has(id));
   let updated = 0;
   let skipped = 0;
   const nowIso = new Date().toISOString();
-  const tx = db.transaction(() => {
-    rows.forEach((row) => {
-      if (row.deleted_at) {
-        skipped++;
-        return;
-      }
-      db.prepare(`UPDATE orders SET deleted_at = ?, deleted_by = ?, delete_reason = ? WHERE id = ?`)
-        .run(nowIso, req.user.id, reason, row.id);
-      updated++;
-    });
-  });
-  tx();
+  for (const row of rows) {
+    if (row.deleted_at) { skipped++; continue; }
+    await db.prepare(`UPDATE orders SET deleted_at = ?, deleted_by = ?, delete_reason = ? WHERE id = ?`)
+      .run(nowIso, req.user.id, reason, row.id);
+    updated++;
+  }
 
   logAuditFromReq(req, {
     action: 'ORDER_BULK_SOFT_DELETED',
@@ -3576,14 +3587,14 @@ app.post('/api/admin/orders/bulk-delete', requireAuth, requireRole('ADMIN', 'OWN
 // Compat: support DELETE method on same route for older frontends.
 app.delete('/api/admin/orders/bulk-delete', requireAuth, requireRole('ADMIN', 'OWNER'), handleBulkSoftDeleteOrders);
 
-app.post('/api/admin/orders/:id/restore', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.post('/api/admin/orders/:id/restore', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Ongeldige order' });
-  const order = db.prepare('SELECT id, status, deleted_at FROM orders WHERE id = ?').get(id);
+  const order = await db.prepare('SELECT id, status, deleted_at FROM orders WHERE id = ?').get(id);
   if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
   if (!order.deleted_at) return res.json({ ok: true, restored: true, alreadyActive: true, orderId: id });
 
-  db.prepare(`UPDATE orders SET deleted_at = NULL, deleted_by = NULL, delete_reason = NULL WHERE id = ?`).run(id);
+  await db.prepare(`UPDATE orders SET deleted_at = NULL, deleted_by = NULL, delete_reason = NULL WHERE id = ?`).run(id);
   logAuditFromReq(req, {
     action: 'ORDER_RESTORED',
     entityType: 'order',
@@ -3593,10 +3604,10 @@ app.post('/api/admin/orders/:id/restore', requireAuth, requireRole('ADMIN', 'OWN
   res.json({ ok: true, restored: true, orderId: id });
 });
 
-app.post('/api/admin/orders/:id/shipment', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.post('/api/admin/orders/:id/shipment', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Ongeldige order' });
-  const order = db.prepare('SELECT id, status, deleted_at FROM orders WHERE id = ?').get(id);
+  const order = await db.prepare('SELECT id, status, deleted_at FROM orders WHERE id = ?').get(id);
   if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
   if (order.deleted_at) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
 
@@ -3608,22 +3619,22 @@ app.post('/api/admin/orders/:id/shipment', requireAuth, requireRole('ADMIN', 'OW
 
   const trackingUrl = buildTrackingUrl(carrier, trackingCode);
   const nowIso = new Date().toISOString();
-  db.prepare(`UPDATE orders
+  await db.prepare(`UPDATE orders
               SET shipping_carrier = ?, tracking_code = ?, tracking_url = ?, shipping_status = ?, shipping_last_update_at = ?
               WHERE id = ?`)
     .run(carrier, trackingCode, trackingUrl, shippingStatus, nowIso, id);
 
   const eventKey = `manual:${id}:${carrier}:${trackingCode}:${nowIso}`;
-  db.prepare(`INSERT INTO shipping_events(event_key, order_id, carrier, status_raw, status_normalized, tracking_code, event_at, payload_json)
+  await db.prepare(`INSERT INTO shipping_events(event_key, order_id, carrier, status_raw, status_normalized, tracking_code, event_at, payload_json)
               VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(eventKey, id, carrier, shippingStatus, shippingStatus, trackingCode, nowIso, JSON.stringify({ source: 'admin_shipment_update' }));
 
   if (['IN_TRANSIT', 'OUT_FOR_DELIVERY'].includes(shippingStatus) && ['PAID', 'IN_PRODUCTION'].includes(order.status)) {
-    db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('SHIPPED', id);
-    addOrderHistory(id, 'SHIPPED', `Automatische update via ${carrier} tracking`, req.user.id);
+    await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('SHIPPED', id);
+    await addOrderHistory(id, 'SHIPPED', `Automatische update via ${carrier} tracking`, req.user.id);
   } else if (shippingStatus === 'DELIVERED' && order.status !== 'DELIVERED') {
-    db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('DELIVERED', id);
-    addOrderHistory(id, 'DELIVERED', `Automatische levering via ${carrier} tracking`, req.user.id);
+    await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('DELIVERED', id);
+    await addOrderHistory(id, 'DELIVERED', `Automatische levering via ${carrier} tracking`, req.user.id);
   }
 
   logAuditFromReq(req, {
@@ -3636,7 +3647,7 @@ app.post('/api/admin/orders/:id/shipment', requireAuth, requireRole('ADMIN', 'OW
   res.json({ ok: true, shipment: { carrier, trackingCode, trackingUrl, shippingStatus, shippingLastUpdateAt: nowIso } });
 });
 
-app.post('/api/admin/shipping/events', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.post('/api/admin/shipping/events', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   const eventKeyRaw = String(req.body?.eventKey || req.body?.idempotencyKey || '').trim();
   const orderId = Number(req.body?.orderId || 0);
   const carrier = normalizeCarrier(req.body?.carrier);
@@ -3647,33 +3658,30 @@ app.post('/api/admin/shipping/events', requireAuth, requireRole('ADMIN', 'OWNER'
   if (!Number.isInteger(orderId) || orderId <= 0) return res.status(400).json({ error: 'orderId is verplicht' });
   if (!carrier || !trackingCode) return res.status(400).json({ error: 'carrier en trackingCode zijn verplicht' });
 
-  const order = db.prepare('SELECT id, status, deleted_at FROM orders WHERE id = ?').get(orderId);
+  const order = await db.prepare('SELECT id, status, deleted_at FROM orders WHERE id = ?').get(orderId);
   if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
   if (order.deleted_at) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
 
   const eventKey = eventKeyRaw || `evt:${orderId}:${carrier}:${trackingCode}:${statusRaw}:${eventAtIso}`;
-  const exists = db.prepare('SELECT id FROM shipping_events WHERE event_key = ?').get(eventKey);
+  const exists = await db.prepare('SELECT id FROM shipping_events WHERE event_key = ?').get(eventKey);
   if (exists) return res.json({ ok: true, duplicate: true, eventId: exists.id });
 
   const trackingUrl = buildTrackingUrl(carrier, trackingCode);
-  const tx = db.transaction(() => {
-    db.prepare(`INSERT INTO shipping_events(event_key, order_id, carrier, status_raw, status_normalized, tracking_code, event_at, payload_json)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(eventKey, orderId, carrier, statusRaw, normalized, trackingCode, eventAtIso, JSON.stringify(req.body || {}));
-    db.prepare(`UPDATE orders
-                SET shipping_carrier = ?, tracking_code = ?, tracking_url = ?, shipping_status = ?, shipping_last_update_at = ?
-                WHERE id = ?`)
-      .run(carrier, trackingCode, trackingUrl, normalized, eventAtIso, orderId);
+  await db.prepare(`INSERT INTO shipping_events(event_key, order_id, carrier, status_raw, status_normalized, tracking_code, event_at, payload_json)
+              VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(eventKey, orderId, carrier, statusRaw, normalized, trackingCode, eventAtIso, JSON.stringify(req.body || {}));
+  await db.prepare(`UPDATE orders
+              SET shipping_carrier = ?, tracking_code = ?, tracking_url = ?, shipping_status = ?, shipping_last_update_at = ?
+              WHERE id = ?`)
+    .run(carrier, trackingCode, trackingUrl, normalized, eventAtIso, orderId);
 
-    if (['IN_TRANSIT', 'OUT_FOR_DELIVERY'].includes(normalized) && ['PAID', 'IN_PRODUCTION'].includes(order.status)) {
-      db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('SHIPPED', orderId);
-      addOrderHistory(orderId, 'SHIPPED', `Automatische update via ${carrier} tracking`, req.user.id);
-    } else if (normalized === 'DELIVERED' && order.status !== 'DELIVERED') {
-      db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('DELIVERED', orderId);
-      addOrderHistory(orderId, 'DELIVERED', `Automatische levering via ${carrier} tracking`, req.user.id);
-    }
-  });
-  tx();
+  if (['IN_TRANSIT', 'OUT_FOR_DELIVERY'].includes(normalized) && ['PAID', 'IN_PRODUCTION'].includes(order.status)) {
+    await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('SHIPPED', orderId);
+    await addOrderHistory(orderId, 'SHIPPED', `Automatische update via ${carrier} tracking`, req.user.id);
+  } else if (normalized === 'DELIVERED' && order.status !== 'DELIVERED') {
+    await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('DELIVERED', orderId);
+    await addOrderHistory(orderId, 'DELIVERED', `Automatische levering via ${carrier} tracking`, req.user.id);
+  }
 
   logAuditFromReq(req, {
     action: 'ORDER_SHIPPING_EVENT_INGESTED',
@@ -3711,7 +3719,7 @@ app.get('/api/admin/orders/:id/email-preview', requireAuth, requireRole('ADMIN',
 app.post('/api/admin/orders/:id/approve', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+    const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
     if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
     if (isOrderArchived(order)) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
     if (FINAL_ORDER_STATUS.includes(order.status)) {
@@ -3721,10 +3729,10 @@ app.post('/api/admin/orders/:id/approve', requireAuth, requireRole('ADMIN', 'OWN
       return res.status(400).json({ error: `Enkel NEW orders kunnen worden goedgekeurd (huidige status: ${statusLabel(order.status)})` });
     }
 
-    const config = getConfig();
-    db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('APPROVED', order.id);
-    addOrderHistory(order.id, 'APPROVED', 'Order goedgekeurd door admin', req.user.id);
-    finalizeInvoiceForOrder(order.id, config);
+    const config = await getConfig();
+    await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('APPROVED', order.id);
+    await addOrderHistory(order.id, 'APPROVED', 'Order goedgekeurd door admin', req.user.id);
+    await finalizeInvoiceForOrder(order.id, config);
 
     logAuditFromReq(req, {
       action: 'ORDER_APPROVED',
@@ -3745,7 +3753,7 @@ app.post('/api/admin/orders/:id/approve', requireAuth, requireRole('ADMIN', 'OWN
 app.post('/api/admin/orders/:id/send-payment-link', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+    const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
     if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
     if (isOrderArchived(order)) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
     if (FINAL_ORDER_STATUS.includes(order.status)) {
@@ -3755,27 +3763,24 @@ app.post('/api/admin/orders/:id/send-payment-link', requireAuth, requireRole('AD
       return res.status(400).json({ error: `Keur de bestelling eerst goed voordat je een betaallink verstuurt` });
     }
 
-    const config = getConfig();
+    const config = await getConfig();
     const extraMsg = (req.body?.extraMessage || '').trim().slice(0, 600);
     const subject = String(req.body?.subject || '').trim().slice(0, 180);
     const includeInvoice = req.body?.includeInvoice !== false;
     const payment = await createCheckoutSessionForOrder(order, config);
 
-    const tx = db.transaction(() => {
-      db.prepare(`INSERT INTO payments(order_id, provider, status, amount, currency, checkout_url,
-                                       provider_payment_id, provider_checkout_id, payment_link_expires_at,
-                                       failure_reason, metadata, created_by)
-                  VALUES(?, 'STRIPE', 'CREATED', ?, ?, ?, NULL, ?, ?, ?, ?, ?)`)
-        .run(
-          order.id, payment.amount, payment.currency, payment.checkoutUrl || null,
-          payment.checkoutId || null, payment.expiresAtIso, null,
-          JSON.stringify({ source: 'admin_send_payment_link', extraMsg: extraMsg || null }),
-          req.user.id
-        );
-      db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('APPROVED_AWAITING_PAYMENT', order.id);
-      addOrderHistory(order.id, 'APPROVED_AWAITING_PAYMENT', 'Betaallink verstuurd naar klant', req.user.id);
-    });
-    tx();
+    await db.prepare(`INSERT INTO payments(order_id, provider, status, amount, currency, checkout_url,
+                                     provider_payment_id, provider_checkout_id, payment_link_expires_at,
+                                     failure_reason, metadata, created_by)
+                VALUES(?, 'STRIPE', 'CREATED', ?, ?, ?, NULL, ?, ?, ?, ?, ?)`)
+      .run(
+        order.id, payment.amount, payment.currency, payment.checkoutUrl || null,
+        payment.checkoutId || null, payment.expiresAtIso, null,
+        JSON.stringify({ source: 'admin_send_payment_link', extraMsg: extraMsg || null }),
+        req.user.id
+      );
+    await db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('APPROVED_AWAITING_PAYMENT', order.id);
+    await addOrderHistory(order.id, 'APPROVED_AWAITING_PAYMENT', 'Betaallink verstuurd naar klant', req.user.id);
 
     logAuditFromReq(req, {
       action: 'PAYMENT_LINK_SENT',
@@ -3829,12 +3834,12 @@ app.post('/api/admin/orders/:id/send-payment-link', requireAuth, requireRole('AD
 app.post('/api/admin/orders/:id/send-invoice', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+    const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
     if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
     if (isOrderArchived(order)) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
     if (!order.customer_email) return res.status(400).json({ error: 'Klant heeft geen e-mailadres' });
 
-    const config = getConfig();
+    const config = await getConfig();
     // Ensure invoice is finalized
     let invoice = ensureInvoiceForOrder(order.id, config) || getInvoiceByOrderId(order.id);
     if (!invoice || invoice.status === 'CONCEPT') {
@@ -3864,7 +3869,7 @@ app.post('/api/admin/orders/:id/send-invoice', requireAuth, requireRole('ADMIN',
 
     if (info?.skipped) {
       // Fall back: send plain email via nodemailer directly
-      const transporter = getMailerTransport();
+      const transporter = await getMailerTransport();
       if (!transporter) return res.status(500).json({ error: 'SMTP niet geconfigureerd' });
       const data = collectOrderDocumentData(id);
       const pdf = data ? await generateInvoicePdfBuffer(data, config) : null;
@@ -3883,7 +3888,7 @@ app.post('/api/admin/orders/:id/send-invoice', requireAuth, requireRole('ADMIN',
       });
     }
 
-    addOrderHistory(order.id, order.status, 'Factuur per e-mail verstuurd', req.user.id);
+    await addOrderHistory(order.id, order.status, 'Factuur per e-mail verstuurd', req.user.id);
     logAuditFromReq(req, {
       action: 'INVOICE_SENT',
       entityType: 'order',
@@ -3898,17 +3903,17 @@ app.post('/api/admin/orders/:id/send-invoice', requireAuth, requireRole('ADMIN',
   }
 });
 
-app.post('/api/admin/orders/:id/create-deposit-invoice', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.post('/api/admin/orders/:id/create-deposit-invoice', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
     const orderId = Number(req.params.id);
-    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+    const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
     if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
     if (isOrderArchived(order)) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
     if (String(order.status || '').toUpperCase() === 'CANCELLED') {
       return res.status(400).json({ error: 'Voorschotfactuur kan niet voor geannuleerde bestelling' });
     }
 
-    const cfg = getConfig();
+    const cfg = await getConfig();
     const finalInvoice = ensureInvoiceForOrder(orderId, cfg) || getInvoiceByOrderId(orderId);
     const total = Math.max(0, Number(order.total) || 0);
     const pctRaw = Number(req.body?.depositPercentage);
@@ -3929,7 +3934,7 @@ app.post('/api/admin/orders/:id/create-deposit-invoice', requireAuth, requireRol
 
     const now = new Date();
     const dueIso = computeInvoiceDueDateIso(now, cfg?.documents?.invoice?.paymentTermsDays);
-    const result = db.prepare(`
+    const result = await db.prepare(`
       INSERT INTO deposit_invoices(order_id, linked_final_invoice_id, status, deposit_percentage, deposit_amount, issue_date, due_date, created_by, metadata)
       VALUES(?, ?, 'DEFINITIVE', ?, ?, ?, ?, ?, ?)
     `).run(
@@ -3945,8 +3950,8 @@ app.post('/api/admin/orders/:id/create-deposit-invoice', requireAuth, requireRol
 
     const depositId = Number(result.lastInsertRowid);
     const invoiceNumber = buildDepositInvoiceNumber(depositId, now);
-    db.prepare('UPDATE deposit_invoices SET invoice_number = ? WHERE id = ?').run(invoiceNumber, depositId);
-    const created = db.prepare('SELECT * FROM deposit_invoices WHERE id = ?').get(depositId);
+    await db.prepare('UPDATE deposit_invoices SET invoice_number = ? WHERE id = ?').run(invoiceNumber, depositId);
+    const created = await db.prepare('SELECT * FROM deposit_invoices WHERE id = ?').get(depositId);
 
     logAuditFromReq(req, {
       action: 'DEPOSIT_INVOICE_CREATED',
@@ -3978,13 +3983,13 @@ app.post('/api/admin/orders/:id/create-deposit-invoice', requireAuth, requireRol
 app.get('/api/admin/orders/:id/deposit-invoice.pdf', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
     const orderId = Number(req.params.id);
-    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+    const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
     if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
     if (isOrderArchived(order)) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
-    const depositInvoice = getLatestDepositInvoiceByOrderId(orderId);
+    const depositInvoice = await getLatestDepositInvoiceByOrderId(orderId);
     if (!depositInvoice) return res.status(404).json({ error: 'Geen voorschotfactuur gevonden' });
-    const finalInvoice = ensureInvoiceForOrder(orderId, getConfig()) || getInvoiceByOrderId(orderId);
-    const pdf = await generateDepositInvoicePdfBuffer({ order, depositInvoice, finalInvoice }, getConfig());
+    const finalInvoice = ensureInvoiceForOrder(orderId, await getConfig()) || getInvoiceByOrderId(orderId);
+    const pdf = await generateDepositInvoicePdfBuffer({ order, depositInvoice, finalInvoice }, await getConfig());
     const fileNo = depositInvoice.invoice_number || buildDepositInvoiceNumber(depositInvoice.id || 0);
     const name = safeFilename(`voorschotfactuur-${fileNo}.pdf`);
     res.setHeader('Content-Type', 'application/pdf');
@@ -3999,12 +4004,12 @@ app.get('/api/admin/orders/:id/deposit-invoice.pdf', requireAuth, requireRole('A
 app.post('/api/admin/orders/:id/send-deposit-invoice', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
     const orderId = Number(req.params.id);
-    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+    const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
     if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
     if (isOrderArchived(order)) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
     if (!order.customer_email) return res.status(400).json({ error: 'Klant heeft geen e-mailadres' });
-    const cfg = getConfig();
-    const depositInvoice = getLatestDepositInvoiceByOrderId(orderId);
+    const cfg = await getConfig();
+    const depositInvoice = await getLatestDepositInvoiceByOrderId(orderId);
     if (!depositInvoice) return res.status(404).json({ error: 'Geen voorschotfactuur gevonden' });
     const finalInvoice = ensureInvoiceForOrder(orderId, cfg) || getInvoiceByOrderId(orderId);
     const pdf = await generateDepositInvoicePdfBuffer({ order, depositInvoice, finalInvoice }, cfg);
@@ -4062,9 +4067,9 @@ app.post('/api/admin/orders/:id/send-deposit-invoice', requireAuth, requireRole(
     }
 
     if (info?.ok) {
-      db.prepare('UPDATE deposit_invoices SET sent_at = COALESCE(sent_at, ?) WHERE id = ?')
+      await db.prepare('UPDATE deposit_invoices SET sent_at = COALESCE(sent_at, ?) WHERE id = ?')
         .run(new Date().toISOString(), depositInvoice.id);
-      addOrderHistory(order.id, order.status, 'Voorschotfactuur per e-mail verstuurd', req.user.id);
+      await addOrderHistory(order.id, order.status, 'Voorschotfactuur per e-mail verstuurd', req.user.id);
     }
 
     logAuditFromReq(req, {
@@ -4087,7 +4092,7 @@ app.get('/api/admin/orders/:id/offer.pdf', requireAuth, requireRole('ADMIN', 'OW
     const id = Number(req.params.id);
     const data = collectOrderDocumentData(id);
     if (!data) return res.status(404).json({ error: 'Order niet gevonden' });
-    const pdf = await generateOfferPdfBuffer(data, getConfig());
+    const pdf = await generateOfferPdfBuffer(data, await getConfig());
     const name = safeFilename(`offerte-${formatOrderId(id)}.pdf`);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
@@ -4101,12 +4106,12 @@ app.get('/api/admin/orders/:id/offer.pdf', requireAuth, requireRole('ADMIN', 'OW
 app.post('/api/admin/orders/:id/send-offer', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+    const order = await db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
     if (!order) return res.status(404).json({ error: 'Order niet gevonden' });
     if (isOrderArchived(order)) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
     if (!order.customer_email) return res.status(400).json({ error: 'Klant heeft geen e-mailadres' });
 
-    const cfg = getConfig();
+    const cfg = await getConfig();
     const data = collectOrderDocumentData(id);
     if (!data) return res.status(404).json({ error: 'Orderdata ontbreekt' });
     const pdf = await generateOfferPdfBuffer(data, cfg);
@@ -4148,7 +4153,7 @@ app.post('/api/admin/orders/:id/send-offer', requireAuth, requireRole('ADMIN', '
     }
 
     if (!info?.ok) return res.status(500).json({ error: 'Offerte e-mail kon niet verzonden worden' });
-    addOrderHistory(order.id, order.status, 'Offerte per e-mail verstuurd', req.user.id);
+    await addOrderHistory(order.id, order.status, 'Offerte per e-mail verstuurd', req.user.id);
     logAuditFromReq(req, {
       action: 'OFFER_SENT',
       entityType: 'order',
@@ -4168,7 +4173,7 @@ app.get('/api/admin/orders/:id/invoice.pdf', requireAuth, requireRole('ADMIN', '
     const id = Number(req.params.id);
     const data = collectOrderDocumentData(id);
     if (!data) return res.status(404).json({ error: 'Order niet gevonden' });
-    const cfg = getConfig();
+    const cfg = await getConfig();
     const pdf = await generateInvoicePdfBuffer(data, cfg);
     const invoiceNo = data.invoice?.invoice_number || buildInvoiceNumber(data.order, cfg, new Date());
     const name = safeFilename(`factuur-${invoiceNo}.pdf`);
@@ -4186,7 +4191,7 @@ app.get('/api/admin/orders/:id/packing-slip.pdf', requireAuth, requireRole('ADMI
     const id = Number(req.params.id);
     const data = collectOrderDocumentData(id);
     if (!data) return res.status(404).json({ error: 'Order niet gevonden' });
-    const pdf = await generatePackingSlipPdfBuffer(data, getConfig());
+    const pdf = await generatePackingSlipPdfBuffer(data, await getConfig());
     const name = safeFilename(`orderbon-${formatOrderId(id)}.pdf`);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
@@ -4197,13 +4202,13 @@ app.get('/api/admin/orders/:id/packing-slip.pdf', requireAuth, requireRole('ADMI
   }
 });
 
-app.get('/api/admin/orders.csv', requireAuth, requireRole('ADMIN', 'OWNER'), (_req, res) => {
+app.get('/api/admin/orders.csv', requireAuth, requireRole('ADMIN', 'OWNER'), async (_req, res) => {
   const archivedRaw = String(_req.query.archived || '').toUpperCase();
   const archived = archivedRaw === 'DELETED' ? 'DELETED' : archivedRaw === 'ALL' ? 'ALL' : 'ACTIVE';
   let where = '1=1';
   if (archived === 'ACTIVE') where += ' AND deleted_at IS NULL';
   if (archived === 'DELETED') where += ' AND deleted_at IS NOT NULL';
-  const rows = db.prepare(`SELECT id, status, customer_first, customer_last, customer_email,
+  const rows = await db.prepare(`SELECT id, status, customer_first, customer_last, customer_email,
                                   customer_company, customer_vat, address, postcode, city, phone, subtotal, total, notes, created_at,
                                   deleted_at, shipping_carrier, tracking_code, tracking_url, shipping_status, shipping_last_update_at
                            FROM orders WHERE ${where} ORDER BY id DESC`).all();
@@ -4221,15 +4226,15 @@ app.get('/api/admin/orders.csv', requireAuth, requireRole('ADMIN', 'OWNER'), (_r
   res.send(csv);
 });
 
-app.get('/api/admin/badges', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
-  const newOrders = db.prepare("SELECT COUNT(*) AS c FROM orders WHERE status = 'NEW' AND deleted_at IS NULL").get().c;
+app.get('/api/admin/badges', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
+  const newOrders = (await db.prepare("SELECT COUNT(*) AS c FROM orders WHERE status = 'NEW' AND deleted_at IS NULL").get()).c;
   let pending = 0;
-  if (req.user.role === 'OWNER') pending = db.prepare("SELECT COUNT(*) AS c FROM users WHERE status = 'PENDING'").get().c;
+  if (req.user.role === 'OWNER') pending = (await db.prepare("SELECT COUNT(*) AS c FROM users WHERE status = 'PENDING'").get()).c;
   res.json({ newOrders, pending });
 });
 
 // ── Owner: users ──────────────────────────────────────────────────────────
-app.get('/api/admin/users', requireAuth, requireRole('OWNER'), (req, res) => {
+app.get('/api/admin/users', requireAuth, requireRole('OWNER'), async (req, res) => {
   const { q = '', tag = '', newsletter = '', status: statusFilter = '', role: roleFilter = '' } = req.query;
   let sql = `SELECT id, email, first_name, last_name, role, status, created_at, last_login_at,
                     email_verified, newsletter_opt_in, tags, company, phone
@@ -4240,41 +4245,41 @@ app.get('/api/admin/users', requireAuth, requireRole('OWNER'), (req, res) => {
   if (roleFilter) { sql += ` AND role = ?`; params.push(roleFilter); }
   if (newsletter === '1') { sql += ` AND newsletter_opt_in = 1`; }
   sql += ` ORDER BY id DESC LIMIT 500`;
-  let rows = db.prepare(sql).all(...params);
+  let rows = await db.prepare(sql).all(...params);
   if (tag) {
     rows = rows.filter(r => {
       try { const t = JSON.parse(r.tags || '[]'); return Array.isArray(t) && t.includes(tag); } catch { return false; }
     });
   }
   // Voeg ordercount toe per gebruiker
-  const countStmt = db.prepare('SELECT COUNT(*) as cnt FROM orders WHERE user_id = ?');
+  const countStmt = await db.prepare('SELECT COUNT(*) as cnt FROM orders WHERE user_id = ?');
   rows = rows.map(r => ({ ...r, order_count: countStmt.get(r.id)?.cnt || 0 }));
   res.json({ users: rows });
 });
 
-app.get('/api/admin/users/:id(\\d+)', requireAuth, requireRole('OWNER'), (req, res) => {
+app.get('/api/admin/users/:id(\\d+)', requireAuth, requireRole('OWNER'), async (req, res) => {
   const id = Number(req.params.id);
-  const user = db.prepare(`SELECT id, email, first_name, last_name, role, status, created_at, last_login_at,
+  const user = await db.prepare(`SELECT id, email, first_name, last_name, role, status, created_at, last_login_at,
                                    address, postcode, city, phone, email_verified, totp_enabled,
                                    newsletter_opt_in, internal_notes, tags, company, vat_number
                            FROM users WHERE id = ?`).get(id);
   if (!user) return res.status(404).json({ error: 'Gebruiker niet gevonden' });
-  const orders = db.prepare(`SELECT id, status, total, created_at FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 20`).all(id);
+  const orders = await db.prepare(`SELECT id, status, total, created_at FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 20`).all(id);
   res.json({ user, orders });
 });
 
-app.get('/api/admin/users/:id(\\d+)/orders', requireAuth, requireRole('OWNER', 'ADMIN'), (req, res) => {
+app.get('/api/admin/users/:id(\\d+)/orders', requireAuth, requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const id = Number(req.params.id);
-  const orders = db.prepare(`SELECT id, status, total, subtotal, created_at, customer_first, customer_last FROM orders WHERE user_id = ? ORDER BY id DESC`).all(id);
+  const orders = await db.prepare(`SELECT id, status, total, subtotal, created_at, customer_first, customer_last FROM orders WHERE user_id = ? ORDER BY id DESC`).all(id);
   res.json({ orders });
 });
 
 const ALLOWED_ROLES = ['USER', 'ADMIN', 'OWNER'];
 const ALLOWED_USER_STATUS = ['PENDING', 'ACTIVE', 'BLOCKED'];
 
-app.put('/api/admin/users/:id(\\d+)', requireAuth, requireRole('OWNER'), (req, res) => {
+app.put('/api/admin/users/:id(\\d+)', requireAuth, requireRole('OWNER'), async (req, res) => {
   const id = Number(req.params.id);
-  const target = db.prepare('SELECT id, role, email, first_name, last_name, status FROM users WHERE id = ?').get(id);
+  const target = await db.prepare('SELECT id, role, email, first_name, last_name, status FROM users WHERE id = ?').get(id);
   if (!target) return res.status(404).json({ error: 'User niet gevonden' });
   if (target.id === req.user.id && (req.body?.status || req.body?.role)) {
     return res.status(400).json({ error: 'Je kan je eigen rol/status niet wijzigen' });
@@ -4286,16 +4291,16 @@ app.put('/api/admin/users/:id(\\d+)', requireAuth, requireRole('OWNER'), (req, r
   const roleChanged = role !== undefined && role !== target.role;
   const statusChanged = status !== undefined && status !== target.status;
 
-  if (role !== undefined) db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id);
-  if (status !== undefined) db.prepare('UPDATE users SET status = ? WHERE id = ?').run(status, id);
-  if (newsletterOptIn !== undefined) db.prepare('UPDATE users SET newsletter_opt_in = ? WHERE id = ?').run(newsletterOptIn ? 1 : 0, id);
-  if (internalNotes !== undefined) db.prepare('UPDATE users SET internal_notes = ? WHERE id = ?').run(String(internalNotes || '').trim().slice(0, 2000), id);
+  if (role !== undefined) await db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id);
+  if (status !== undefined) await db.prepare('UPDATE users SET status = ? WHERE id = ?').run(status, id);
+  if (newsletterOptIn !== undefined) await db.prepare('UPDATE users SET newsletter_opt_in = ? WHERE id = ?').run(newsletterOptIn ? 1 : 0, id);
+  if (internalNotes !== undefined) await db.prepare('UPDATE users SET internal_notes = ? WHERE id = ?').run(String(internalNotes || '').trim().slice(0, 2000), id);
   if (tags !== undefined) {
     const tagsArr = Array.isArray(tags) ? tags.map(t => String(t).trim().slice(0, 40)).filter(Boolean).slice(0, 20) : [];
-    db.prepare('UPDATE users SET tags = ? WHERE id = ?').run(JSON.stringify(tagsArr), id);
+    await db.prepare('UPDATE users SET tags = ? WHERE id = ?').run(JSON.stringify(tagsArr), id);
   }
-  if (company !== undefined) db.prepare('UPDATE users SET company = ? WHERE id = ?').run(String(company || '').trim().slice(0, 120), id);
-  if (vatNumber !== undefined) db.prepare('UPDATE users SET vat_number = ? WHERE id = ?').run(String(vatNumber || '').trim().slice(0, 40), id);
+  if (company !== undefined) await db.prepare('UPDATE users SET company = ? WHERE id = ?').run(String(company || '').trim().slice(0, 120), id);
+  if (vatNumber !== undefined) await db.prepare('UPDATE users SET vat_number = ? WHERE id = ?').run(String(vatNumber || '').trim().slice(0, 40), id);
 
   if (roleChanged || statusChanged) {
     const pieces = [];
@@ -4319,19 +4324,19 @@ app.put('/api/admin/users/:id(\\d+)', requireAuth, requireRole('OWNER'), (req, r
   if (resendVerification) {
     const token = crypto.randomBytes(32).toString('hex');
     const tokenExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-    db.prepare('UPDATE users SET email_verification_token = ?, email_verification_token_expires_at = ? WHERE id = ?')
+    await db.prepare('UPDATE users SET email_verification_token = ?, email_verification_token_expires_at = ? WHERE id = ?')
       .run(token, tokenExpiry, id);
-    const verificationUrl = `${getAppBaseUrl()}/api/auth/verify-email?token=${token}`;
+    const verificationUrl = `${await getAppBaseUrl()}/api/auth/verify-email?token=${token}`;
     sendTemplatedEmailSafe('emailVerification', target.email, { verificationUrl, customerName: `${target.first_name || ''} ${target.last_name || ''}`.trim() });
   }
   res.json({ ok: true });
 });
 
-app.delete('/api/admin/users/:id(\\d+)', requireAuth, requireRole('OWNER'), (req, res) => {
+app.delete('/api/admin/users/:id(\\d+)', requireAuth, requireRole('OWNER'), async (req, res) => {
   const id = Number(req.params.id);
   if (id === req.user.id) return res.status(400).json({ error: 'Je kan jezelf niet verwijderen' });
-  const target = db.prepare('SELECT id, email, role, status FROM users WHERE id = ?').get(id);
-  db.prepare('DELETE FROM users WHERE id = ?').run(id);
+  const target = await db.prepare('SELECT id, email, role, status FROM users WHERE id = ?').get(id);
+  await db.prepare('DELETE FROM users WHERE id = ?').run(id);
   if (target) {
     logAuditFromReq(req, {
       action: 'USER_DELETED',
@@ -4345,9 +4350,9 @@ app.delete('/api/admin/users/:id(\\d+)', requireAuth, requireRole('OWNER'), (req
 });
 
 // ── Owner: settings ───────────────────────────────────────────────────────
-app.put('/api/admin/config', requireAuth, requireRole('OWNER'), (req, res) => {
+app.put('/api/admin/config', requireAuth, requireRole('OWNER'), async (req, res) => {
   const cfg = req.body || {};
-  const before = getConfig();
+  const before = await getConfig();
   const cleanText = (v, max = 180) => String(v == null ? '' : v).trim().slice(0, max);
   if (cfg.colors && !Array.isArray(cfg.colors)) return res.status(400).json({ error: 'colors moet een lijst zijn' });
   if (cfg.sizes && !Array.isArray(cfg.sizes)) return res.status(400).json({ error: 'sizes moet een lijst zijn' });
@@ -4501,8 +4506,8 @@ app.put('/api/admin/config', requireAuth, requireRole('OWNER'), (req, res) => {
       : Math.max(0, Math.min(8, Math.round(Number(before?.hero?.videoBlurPx ?? 0))));
   }
   const next = { ...before, ...cfg };
-  setSetting('config', next);
-  const saved = getConfig();
+  await setSetting('config', next);
+  const saved = await getConfig();
   const audit = buildConfigAuditChangeSet(before, saved);
   logAuditFromReq(req, {
     action: 'CONFIG_UPDATED',
@@ -4605,9 +4610,9 @@ app.post('/api/admin/products/mockup', requireAuth, requireRole('OWNER', 'ADMIN'
 });
 
 // ── Notifications (live aggregation) ────────────────────────────────────────
-app.get('/api/admin/notifications', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.get('/api/admin/notifications', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
-    const overdueInvoices = db.prepare(`
+    const overdueInvoices = await db.prepare(`
       SELECT i.id, i.invoice_number, i.due_date, o.id AS order_id, o.total,
              o.customer_first, o.customer_last, o.customer_email
       FROM invoices i JOIN orders o ON o.id = i.order_id
@@ -4617,17 +4622,17 @@ app.get('/api/admin/notifications', requireAuth, requireRole('ADMIN', 'OWNER'), 
       ORDER BY i.due_date ASC LIMIT 50
     `).all();
 
-    const newOrders = db.prepare(`
+    const newOrders = await db.prepare(`
       SELECT id, customer_first, customer_last, total, created_at
       FROM orders WHERE status = 'NEW' AND deleted_at IS NULL ORDER BY id DESC LIMIT 20
     `).all();
 
-    const awaitingPaymentLink = db.prepare(`
+    const awaitingPaymentLink = await db.prepare(`
       SELECT id, customer_first, customer_last, total, created_at
       FROM orders WHERE status = 'APPROVED' AND deleted_at IS NULL ORDER BY id DESC LIMIT 20
     `).all();
 
-    const recentPayments = db.prepare(`
+    const recentPayments = await db.prepare(`
       SELECT o.id AS order_id, o.customer_first, o.customer_last, o.total,
              p.paid_at, p.amount
       FROM payments p JOIN orders o ON o.id = p.order_id
@@ -4636,13 +4641,13 @@ app.get('/api/admin/notifications', requireAuth, requireRole('ADMIN', 'OWNER'), 
       ORDER BY p.paid_at DESC LIMIT 20
     `).all();
 
-    const pendingAccounts = db.prepare(`
+    const pendingAccounts = await db.prepare(`
       SELECT id, email, first_name, last_name, created_at
       FROM users WHERE status = 'PENDING' ORDER BY id DESC LIMIT 10
     `).all();
 
     const todoSignals = [];
-    const unsentInvoicesCount = db.prepare(`
+    const unsentInvoicesCount = await db.prepare(`
       SELECT COUNT(*) AS n
       FROM invoices
       WHERE status = 'DEFINITIVE'
@@ -4660,7 +4665,7 @@ app.get('/api/admin/notifications', requireAuth, requireRole('ADMIN', 'OWNER'), 
       });
     }
 
-    const awaitingProdCount = db.prepare(`
+    const awaitingProdCount = await db.prepare(`
       SELECT COUNT(*) AS n
       FROM orders
       WHERE status = 'PAID' AND deleted_at IS NULL
@@ -4682,23 +4687,23 @@ app.get('/api/admin/notifications', requireAuth, requireRole('ADMIN', 'OWNER'), 
 });
 
 // ── Newsletter routes ────────────────────────────────────────────────────────
-app.get('/api/admin/users/newsletter', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.get('/api/admin/users/newsletter', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
-    const subscribers = db.prepare(`
+    const subscribers = await db.prepare(`
       SELECT id, email, first_name, last_name, created_at
       FROM users WHERE newsletter_opt_in = 1 AND status != 'BANNED'
       ORDER BY created_at DESC
     `).all();
-    const total = db.prepare(`SELECT COUNT(*) AS n FROM users WHERE status != 'BANNED'`).get()?.n || 0;
+    const total = (await db.prepare(`SELECT COUNT(*) AS n FROM users WHERE status != 'BANNED'`).get())?.n || 0;
     res.json({ subscribers, total });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/api/admin/users/newsletter.csv', requireAuth, requireRole('ADMIN', 'OWNER'), (req, res) => {
+app.get('/api/admin/users/newsletter.csv', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
   try {
-    const rows = db.prepare(`
+    const rows = await db.prepare(`
       SELECT id, email, first_name, last_name, created_at
       FROM users WHERE newsletter_opt_in = 1 AND status != 'BANNED'
       ORDER BY created_at DESC
@@ -4718,9 +4723,9 @@ app.post('/api/admin/newsletter/send', requireAuth, requireRole('OWNER'), async 
   const { subject, html } = req.body || {};
   if (!subject || !html) return res.status(400).json({ error: 'subject en html zijn verplicht' });
   try {
-    const cfg = getConfig();
+    const cfg = await getConfig();
     if (!cfg.smtp?.host) return res.status(400).json({ error: 'SMTP niet geconfigureerd' });
-    const subscribers = db.prepare(`
+    const subscribers = await db.prepare(`
       SELECT email, first_name, last_name FROM users
       WHERE newsletter_opt_in = 1 AND status != 'BANNED' LIMIT 200
     `).all();
@@ -4746,7 +4751,7 @@ app.post('/api/admin/newsletter/send', requireAuth, requireRole('OWNER'), async 
       } catch { failed++; }
     }
 
-    db.prepare(`INSERT INTO audit_log (user_id, user_email, action, summary, created_at)
+    await db.prepare(`INSERT INTO audit_log (user_id, user_email, action, summary, created_at)
       VALUES (?, ?, 'NEWSLETTER_SENT', ?, datetime('now'))`)
       .run(req.user.id, req.user.email, `Nieuwsbrief verstuurd: "${subject}" — ${sent} verzonden, ${failed} mislukt`);
 
@@ -4756,7 +4761,7 @@ app.post('/api/admin/newsletter/send', requireAuth, requireRole('OWNER'), async 
   }
 });
 
-app.get('/api/admin/audit', requireAuth, requireRole('OWNER'), (req, res) => {
+app.get('/api/admin/audit', requireAuth, requireRole('OWNER'), async (req, res) => {
   const page = Math.max(1, Number(req.query.page) || 1);
   const limit = Math.min(100, Math.max(10, Number(req.query.limit) || 30));
   const offset = (page - 1) * limit;
@@ -4774,8 +4779,8 @@ app.get('/api/admin/audit', requireAuth, requireRole('OWNER'), (req, res) => {
     params.action = action;
   }
 
-  const total = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE ${where}`).get(params).c;
-  const logs = db.prepare(`
+  const total = (await db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE ${where}`).get(params)).c;
+  const logs = await db.prepare(`
     SELECT id, actor_user_id, actor_email, action, entity_type, entity_id, summary, details, created_at
     FROM audit_log
     WHERE ${where}
@@ -4783,7 +4788,7 @@ app.get('/api/admin/audit', requireAuth, requireRole('OWNER'), (req, res) => {
     LIMIT ${limit} OFFSET ${offset}
   `).all(params);
 
-  const actions = db.prepare(`SELECT action, COUNT(*) AS count FROM audit_log GROUP BY action ORDER BY action`).all();
+  const actions = await db.prepare(`SELECT action, COUNT(*) AS count FROM audit_log GROUP BY action ORDER BY action`).all();
 
   res.json({
     logs,
@@ -4818,10 +4823,10 @@ app.post('/api/admin/email/test', requireAuth, requireRole('OWNER'), async (req,
 });
 
 // ── Owner: Stripe configuratie ────────────────────────────────────────────
-app.get('/api/admin/config/stripe', requireAuth, requireRole('OWNER'), (req, res) => {
-  const secretKey = getStripeSecretKey();
-  const webhookSecret = getStripeWebhookSecret();
-  const appUrl = getSetting('stripe_app_base_url') || APP_BASE_URL;
+app.get('/api/admin/config/stripe', requireAuth, requireRole('OWNER'), async (req, res) => {
+  const secretKey = await getStripeSecretKey();
+  const webhookSecret = await getStripeWebhookSecret();
+  const appUrl = await getSetting('stripe_app_base_url') || APP_BASE_URL;
   res.json({
     secretKeySet: !!secretKey,
     secretKeyMasked: secretKey ? ('sk_' + '*'.repeat(20) + secretKey.slice(-4)) : '',
@@ -4836,23 +4841,23 @@ app.put('/api/admin/config/stripe', requireAuth, requireRole('OWNER'), async (re
   if (secretKey !== undefined && secretKey !== null && secretKey !== '') {
     const cleaned = String(secretKey).trim();
     if (!cleaned.startsWith('sk_')) return res.status(400).json({ error: 'Secret key moet beginnen met sk_' });
-    const enc = encryptSetting(cleaned);
+    const enc = await encryptSetting(cleaned);
     const { setSetting: ss } = require('./db');
-    require('./db').setSetting('stripe_secret_key_enc', enc);
+    await require('./db').setSetting('stripe_secret_key_enc', enc);
     _stripeCache = null;
     _stripeCacheKey = null;
   }
   if (webhookSecret !== undefined && webhookSecret !== null && webhookSecret !== '') {
     const cleaned = String(webhookSecret).trim();
     if (!cleaned.startsWith('whsec_')) return res.status(400).json({ error: 'Webhook secret moet beginnen met whsec_' });
-    require('./db').setSetting('stripe_webhook_secret_enc', encryptSetting(cleaned));
+    await require('./db').setSetting('stripe_webhook_secret_enc', await encryptSetting(cleaned));
   }
   if (appBaseUrl !== undefined && appBaseUrl !== null) {
-    require('./db').setSetting('stripe_app_base_url', String(appBaseUrl).trim().replace(/\/+$/, ''));
+    await require('./db').setSetting('stripe_app_base_url', String(appBaseUrl).trim().replace(/\/+$/, ''));
   }
   if (test) {
     try {
-      const client = getStripeClient();
+      const client = await getStripeClient();
       if (!client) return res.status(400).json({ error: 'Geen Stripe-sleutel geconfigureerd' });
       await client.paymentMethods.list({ limit: 1 });
       logAuditFromReq(req, { action: 'CONFIG_UPDATED', entityType: 'STRIPE', summary: 'Stripe configuratie getest en opgeslagen' });
@@ -4867,7 +4872,7 @@ app.put('/api/admin/config/stripe', requireAuth, requireRole('OWNER'), async (re
 
 app.get('/api/admin/config/stripe/test', requireAuth, requireRole('OWNER'), async (req, res) => {
   try {
-    const client = getStripeClient();
+    const client = await getStripeClient();
     if (!client) return res.status(400).json({ error: 'Geen Stripe-sleutel geconfigureerd' });
     await client.paymentMethods.list({ limit: 1 });
     res.json({ ok: true, connected: true });
@@ -4887,7 +4892,7 @@ app.post('/api/admin/products/:productId/colors/:hex/mockup',
       if (!/^#[0-9a-f]{6}$/.test(hexRaw)) return res.status(400).json({ error: 'Ongeldige hex-kleur' });
       if (!req.file?.buffer?.length) return res.status(400).json({ error: 'Geen bestand geüpload' });
 
-      const cfg = getConfig();
+      const cfg = await getConfig();
       const products = Array.isArray(cfg.products) ? cfg.products : [];
       const prodIdx = products.findIndex(p => String(p.id || '').toLowerCase() === productId);
       if (prodIdx < 0) return res.status(404).json({ error: 'Product niet gevonden' });
@@ -4910,7 +4915,7 @@ app.post('/api/admin/products/:productId/colors/:hex/mockup',
         return { ...p, colorData };
       });
       const newCfg = { ...cfg, products: updatedProducts };
-      setSetting('config', newCfg);
+      await setSetting('config', newCfg);
       logAuditFromReq(req, { action: 'PRODUCT_COLOR_MOCKUP_UPLOADED', entityType: 'PRODUCT', entityId: productId, summary: `Kleur-mockup geüpload voor ${productId} ${hexRaw}` });
       res.json({ ok: true, mockupPath: relativePath });
     } catch (err) {
@@ -4923,12 +4928,12 @@ app.post('/api/admin/products/:productId/colors/:hex/mockup',
 // DELETE: verwijder kleur-mockup
 app.delete('/api/admin/products/:productId/colors/:hex/mockup',
   requireAuth, requireRole('ADMIN', 'OWNER'),
-  (req, res) => {
+  async (req, res) => {
     const productId = String(req.params.productId || '').trim().toLowerCase();
     const hexRaw = String(req.params.hex || '').trim().toLowerCase().replace(/^#?/, '#');
     if (!/^#[0-9a-f]{6}$/.test(hexRaw)) return res.status(400).json({ error: 'Ongeldige hex-kleur' });
 
-    const cfg = getConfig();
+    const cfg = await getConfig();
     const products = Array.isArray(cfg.products) ? cfg.products : [];
     const prodIdx = products.findIndex(p => String(p.id || '').toLowerCase() === productId);
     if (prodIdx < 0) return res.status(404).json({ error: 'Product niet gevonden' });
@@ -4939,20 +4944,22 @@ app.delete('/api/admin/products/:productId/colors/:hex/mockup',
       if (colorData[hexRaw]) colorData[hexRaw] = { ...colorData[hexRaw], mockupPath: '' };
       return { ...p, colorData };
     });
-    setSetting('config', { ...cfg, products: updatedProducts });
+    await setSetting('config', { ...cfg, products: updatedProducts });
     res.json({ ok: true });
   }
 );
 
 // ── Owner: backup ─────────────────────────────────────────────────────────
-app.get('/api/admin/backup', requireAuth, requireRole('OWNER'), (_req, res) => {
+app.get('/api/admin/backup', requireAuth, requireRole('OWNER'), async (_req, res) => {
+  if (USE_PG) return res.status(501).json({ error: 'Backup is niet beschikbaar in PostgreSQL-modus. Gebruik de Supabase dashboard.' });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const file = path.join(BACKUP_DIR, `nebulous-${stamp}.sqlite`);
-  db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
+  await db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
   res.download(file, path.basename(file));
 });
 
-app.post('/api/admin/backup/restore', requireAuth, requireRole('OWNER'), restoreUpload.single('backup'), (req, res) => {
+app.post('/api/admin/backup/restore', requireAuth, requireRole('OWNER'), restoreUpload.single('backup'), async (req, res) => {
+  if (USE_PG) return res.status(501).json({ error: 'Restore is niet beschikbaar in PostgreSQL-modus. Gebruik de Supabase dashboard.' });
   if (!req.file?.buffer?.length) return res.status(400).json({ error: 'Geen backupbestand geüpload' });
 
   const tmpFile = path.join(BACKUP_DIR, `restore-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.sqlite`);
@@ -4972,15 +4979,17 @@ app.post('/api/admin/backup/restore', requireAuth, requireRole('OWNER'), restore
       if (!cols.length) throw new Error(`Backup mist vereiste tabel: ${table}`);
     }
 
+    // SQLite-only restore: use raw sync API inside transaction
+    const rawDb = db._raw;
     const deleteOrder = [...RESTORE_TABLES].reverse();
     const insertOrder = [...RESTORE_TABLES];
-    const tx = db.transaction(() => {
+    const tx = rawDb.transaction(() => {
       deleteOrder.forEach((table) => {
-        db.prepare(`DELETE FROM ${quoteIdent(table)}`).run();
+        rawDb.prepare(`DELETE FROM ${quoteIdent(table)}`).run();
       });
 
       insertOrder.forEach((table) => {
-        const targetCols = getTableColumns(db, table);
+        const targetCols = getTableColumns(rawDb, table);
         const sourceCols = getTableColumns(sourceDb, table);
         const commonCols = targetCols.filter(c => sourceCols.includes(c));
         if (!commonCols.length) return;
@@ -4990,13 +4999,13 @@ app.post('/api/admin/backup/restore', requireAuth, requireRole('OWNER'), restore
         if (!rows.length) return;
 
         const placeholders = commonCols.map(() => '?').join(', ');
-        const ins = db.prepare(`INSERT INTO ${quoteIdent(table)} (${columnSql}) VALUES (${placeholders})`);
+        const ins = rawDb.prepare(`INSERT INTO ${quoteIdent(table)} (${columnSql}) VALUES (${placeholders})`);
         rows.forEach((row) => ins.run(...commonCols.map(c => row[c])));
       });
     });
     tx();
 
-    logAudit({
+    await logAudit({
       actorUserId: null,
       actorEmail: req.user?.email || null,
       action: 'BACKUP_RESTORED',
@@ -5025,7 +5034,8 @@ app.post('/api/admin/backup/restore', requireAuth, requireRole('OWNER'), restore
 app.get('/api/health', async (_req, res) => {
   const now = new Date();
   try {
-    const dbOk = !!db.prepare('SELECT 1 AS ok').get()?.ok;
+    const dbRow = await db.prepare('SELECT 1 AS ok').get();
+    const dbOk = !!dbRow?.ok;
     if (!dbOk) throw new Error('DB check failed');
     const reminderJob = await processInvoiceRemindersSafe(false);
     res.json({
@@ -5058,7 +5068,7 @@ app.get('/api/health', async (_req, res) => {
   }
 });
 
-app.get('/uploads-signed', (req, res) => {
+app.get('/uploads-signed', async (req, res) => {
   const p = req.query?.p;
   const exp = Number(req.query?.exp || 0);
   const sig = String(req.query?.sig || '');
@@ -5076,8 +5086,8 @@ app.get('/uploads-signed', (req, res) => {
   res.sendFile(normalized.abs);
 });
 
-app.get('/uploads/*', (req, res) => {
-  const u = currentUser(req);
+app.get('/uploads/*', async (req, res) => {
+  const u = await currentUser(req);
   if (!u) return res.status(401).end();
   const normalized = normalizeUploadPath(req.params[0]);
   if (!normalized || !fs.existsSync(normalized.abs)) return res.status(404).end();
@@ -5087,9 +5097,9 @@ app.get('/uploads/*', (req, res) => {
   res.sendFile(normalized.abs);
 });
 
-app.get('/', (_req, res) => {
+app.get('/', async (_req, res) => {
   try {
-    const cfg = getConfig();
+    const cfg = await getConfig();
     res.type('html').send(renderIndexWithSeo(cfg));
   } catch (err) {
     console.error('SEO render fallback naar statische index:', err?.message || err);
@@ -5097,9 +5107,9 @@ app.get('/', (_req, res) => {
   }
 });
 
-app.get('/designer', (_req, res) => {
+app.get('/designer', async (_req, res) => {
   try {
-    const cfg = getConfig();
+    const cfg = await getConfig();
     res.type('html').send(renderIndexWithSeo(cfg));
   } catch (err) {
     console.error('Designer render fallback naar statische index:', err?.message || err);
@@ -5115,7 +5125,7 @@ const pageRoutes = [
   '/verzending', '/legal', '/privacy', '/voorwaarden', '/retourneren'
 ];
 pageRoutes.forEach(route => {
-  app.get(route, (_req, res) => {
+  app.get(route, async (_req, res) => {
     res.sendFile(path.join(ROOT, 'public', route.replace('/', '') + '.html'));
   });
 });
@@ -5131,4 +5141,18 @@ app.use((err, _req, res, next) => {
   return next(err);
 });
 
-app.listen(PORT, () => console.log(`Nebulous draait op http://localhost:${PORT}`));
+// ── Async startup + Vercel export ─────────────────────────────────────────────
+async function startServer() {
+  await boot();
+  app.listen(PORT, () => console.log(`Nebulous draait op http://localhost:${PORT}`));
+}
+
+// If run directly (not imported by Vercel), start the server
+if (require.main === module) {
+  startServer().catch(err => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = { app, boot };

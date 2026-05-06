@@ -3,5 +3,10 @@ data/
 uploads/
 .DS_Store
 .env
+.env.local
 .claude/
 .vercel
+db-sqlite.js
+server-sqlite.js
+convert-async.js
+*.sqlite
