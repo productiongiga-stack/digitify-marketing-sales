@@ -5045,6 +5045,16 @@ app.post('/api/admin/backup/restore', requireAuth, requireRole('OWNER'), restore
   }
 });
 
+// Debug endpoint for session diagnostics
+app.get('/api/debug/session', (req, res) => {
+  res.json({
+    hasSession: !!req.session,
+    sessionID: req.sessionID || null,
+    booted: _booted,
+    sessionHandlerType: typeof _sessionHandler
+  });
+});
+
 // ── Static & uploads ──────────────────────────────────────────────────────
 app.get('/api/health', async (_req, res) => {
   const now = new Date();
