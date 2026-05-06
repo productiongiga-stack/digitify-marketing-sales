@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "seed:owner": "node scripts/seed-owner.js"
+    "seed:owner": "node scripts/seed-owner.js",
+    "check:db-migration": "node scripts/check-db-migration.js"
   },
   "dependencies": {
     "archiver": "^7.0.1",
