@@ -82,7 +82,7 @@ function convertDatetime(sql) {
 
 /** Detect INSERT and append RETURNING id if not already present.
  *  Skip tables that don't have an `id` column (e.g. settings with `key` PK). */
-const NO_ID_TABLES = new Set(['settings']);
+const NO_ID_TABLES = new Set(['settings', 'upload_blobs']);
 function maybeAddReturning(sql) {
   const trimmed = sql.trim().toUpperCase();
   if (trimmed.startsWith('INSERT') && !trimmed.includes('RETURNING')) {

@@ -99,6 +99,85 @@ async function ensureAuditLogSchemaCompat() {
   }
 }
 
+async function ensurePgColumn(tableName, columnName, definitionSql) {
+  await db.exec(`ALTER TABLE ${tableName} ADD COLUMN IF NOT EXISTS ${columnName} ${definitionSql};`);
+}
+
+async function ensurePgRuntimeSchemaCompat() {
+  if (!USE_PG) return;
+
+  await db.exec(`
+CREATE TABLE IF NOT EXISTS shipping_events (
+  id SERIAL PRIMARY KEY,
+  event_key TEXT UNIQUE,
+  order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  carrier TEXT,
+  status_raw TEXT,
+  status_normalized TEXT,
+  tracking_code TEXT,
+  event_at TIMESTAMPTZ,
+  payload_json TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS deposit_invoices (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  linked_final_invoice_id INTEGER REFERENCES invoices(id) ON DELETE SET NULL,
+  invoice_number TEXT,
+  status TEXT NOT NULL DEFAULT 'DEFINITIVE',
+  deposit_percentage REAL,
+  deposit_amount REAL NOT NULL DEFAULT 0,
+  issue_date TIMESTAMPTZ,
+  due_date TIMESTAMPTZ,
+  sent_at TIMESTAMPTZ,
+  paid_at TIMESTAMPTZ,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  metadata TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+  `);
+
+  const columnAdds = [
+    ['orders', 'deleted_at', 'TIMESTAMPTZ'],
+    ['orders', 'deleted_by', 'INTEGER REFERENCES users(id)'],
+    ['orders', 'delete_reason', 'TEXT'],
+    ['orders', 'shipping_carrier', 'TEXT'],
+    ['orders', 'tracking_code', 'TEXT'],
+    ['orders', 'tracking_url', 'TEXT'],
+    ['orders', 'shipping_status', 'TEXT'],
+    ['orders', 'shipping_last_update_at', 'TIMESTAMPTZ'],
+
+    ['order_items', 'product_label', "TEXT NOT NULL DEFAULT 'T-shirt'"],
+    ['order_items', 'product_mockup_path', 'TEXT'],
+    ['order_items', 'product_price_multiplier', 'REAL NOT NULL DEFAULT 1'],
+
+    ['order_status_history', 'changed_by_email', 'TEXT'],
+
+    ['payments', 'provider_checkout_id', 'TEXT'],
+    ['payments', 'payment_link_expires_at', 'TIMESTAMPTZ'],
+    ['payments', 'failure_reason', 'TEXT'],
+    ['payments', 'metadata', 'TEXT'],
+    ['payments', 'created_by', 'INTEGER REFERENCES users(id)'],
+    ['payments', 'updated_at', 'TIMESTAMPTZ NOT NULL DEFAULT NOW()'],
+
+    ['invoices', 'finalized_at', 'TIMESTAMPTZ'],
+    ['invoices', 'sent_at', 'TIMESTAMPTZ'],
+    ['invoices', 'last_reminder_at', 'TIMESTAMPTZ'],
+    ['invoices', 'reminder_count', 'INTEGER NOT NULL DEFAULT 0'],
+    ['invoices', 'metadata', 'TEXT'],
+    ['invoices', 'updated_at', 'TIMESTAMPTZ NOT NULL DEFAULT NOW()'],
+
+    ['email_tracking', 'first_opened_at', 'TIMESTAMPTZ'],
+    ['email_tracking', 'open_count', 'INTEGER NOT NULL DEFAULT 0']
+  ];
+
+  for (const [tableName, columnName, definitionSql] of columnAdds) {
+    await ensurePgColumn(tableName, columnName, definitionSql);
+  }
+}
+
 // ── Schema init ───────────────────────────────────────────────────────────────
 async function initDatabase() {
   if (USE_PG) {
@@ -127,6 +206,7 @@ CREATE TABLE IF NOT EXISTS upload_blobs (
 );
 CREATE INDEX IF NOT EXISTS idx_upload_blobs_updated_at ON upload_blobs(updated_at);
     `);
+    await ensurePgRuntimeSchemaCompat();
     await ensureAuditLogSchemaCompat();
   } else {
     // SQLite schema (inline, same as original db.js)
