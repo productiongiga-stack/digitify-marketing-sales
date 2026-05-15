@@ -24,7 +24,7 @@ function getPool() {
   const connStr = process.env.DATABASE_URL;
   if (!connStr) throw new Error('DATABASE_URL environment variable is required for PostgreSQL mode');
 
-  const max = Math.max(1, Math.min(8, Number(process.env.PG_POOL_MAX) || 4));
+  const max = Math.max(1, Math.min(8, Number(process.env.PG_POOL_MAX) || 2));
   pool = new Pool({
     connectionString: connStr,
     ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
@@ -183,6 +183,9 @@ async function close() {
 
 // Helper: run the schema.sql file to initialize DB
 async function initSchema() {
+  if (String(process.env.PG_AUTO_INIT_SCHEMA || '').toLowerCase() !== 'true') {
+    return;
+  }
   const fs = require('fs');
   const path = require('path');
   const schemaPath = path.join(__dirname, 'schema.sql');
