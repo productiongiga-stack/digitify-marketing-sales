@@ -50,6 +50,17 @@ if (USE_PG) {
 async function initDatabase() {
   if (USE_PG) {
     await db.initSchema();
+    await db.exec(`
+CREATE TABLE IF NOT EXISTS upload_blobs (
+  path TEXT PRIMARY KEY,
+  mime_type TEXT NOT NULL,
+  data BYTEA NOT NULL,
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_upload_blobs_updated_at ON upload_blobs(updated_at);
+    `);
   } else {
     // SQLite schema (inline, same as original db.js)
     await db.exec(`
@@ -255,6 +266,15 @@ CREATE TABLE IF NOT EXISTS audit_log (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS upload_blobs (
+  path TEXT PRIMARY KEY,
+  mime_type TEXT NOT NULL,
+  data BLOB NOT NULL,
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_deleted_at ON orders(deleted_at);
@@ -274,6 +294,7 @@ CREATE INDEX IF NOT EXISTS idx_deposit_invoices_order ON deposit_invoices(order_
 CREATE INDEX IF NOT EXISTS idx_deposit_invoices_status ON deposit_invoices(status);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+CREATE INDEX IF NOT EXISTS idx_upload_blobs_updated_at ON upload_blobs(updated_at);
     `);
 
     // SQLite triggers

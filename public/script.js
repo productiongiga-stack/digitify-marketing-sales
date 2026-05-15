@@ -228,8 +228,6 @@ function _nebMain() {
     let previewRefreshRaf = 0;
 
     // Theme toggle
-    const themeDarkBtn = $('#themeDark');
-    const themeLightBtn = $('#themeLight');
 
     const isMobileLayout = window.matchMedia('(max-width: 700px)').matches;
     const isCoarsePointer = window.matchMedia('(pointer: coarse)').matches;
@@ -241,27 +239,11 @@ function _nebMain() {
     }
 
     // ── Theme init ──
-    const savedTheme = localStorage.getItem('neb_theme');
-    if (savedTheme === 'light' || savedTheme === 'dark') {
-        state.theme = savedTheme;
-    }
-    applyTheme(state.theme);
-
-    themeDarkBtn?.addEventListener('click', () => {
-        state.theme = 'dark';
-        applyTheme('dark');
-        localStorage.setItem('neb_theme', 'dark');
-    });
-    themeLightBtn?.addEventListener('click', () => {
-        state.theme = 'light';
-        applyTheme('light');
-        localStorage.setItem('neb_theme', 'light');
-    });
+    state.theme = 'dark';
+    applyTheme('dark');
 
     function applyTheme(theme) {
-        document.body.classList.toggle('theme-light', theme === 'light');
-        themeDarkBtn?.classList.toggle('active', theme === 'dark');
-        themeLightBtn?.classList.toggle('active', theme === 'light');
+        document.body.classList.remove('theme-light');
         // Ensure UI pieces that depend on theme stay readable
         updateActiveDesignLabel();
     }
@@ -1519,7 +1501,7 @@ function _nebMain() {
             const sourceRect = tshirt3d.getBoundingClientRect();
             const targetRect = productPreviewCanvas?.getBoundingClientRect();
             const fitScale = (sourceRect.width && sourceRect.height && targetRect?.width && targetRect?.height)
-                ? Math.min((targetRect.width * 0.82) / sourceRect.width, (targetRect.height * 0.82) / sourceRect.height)
+                ? Math.min((targetRect.width * 0.92) / sourceRect.width, (targetRect.height * 0.92) / sourceRect.height)
                 : 1;
             const baseTransform = tshirt3d.style.transform && tshirt3d.style.transform !== 'none'
                 ? tshirt3d.style.transform
@@ -2190,6 +2172,65 @@ async function placeOrder() {
     window.addEventListener('pagehide', () => clearDesignerDraft());
 
     // Initial position / draft restore
+    if (['localhost', '127.0.0.1'].includes(location.hostname)) {
+        window.__NEB_DESIGNER_DEBUG__ = {
+            async injectSyntheticFiles(specs = []) {
+                if (!Array.isArray(specs) || !specs.length) return false;
+                const files = specs.map((spec, idx) => {
+                    const w = Math.max(100, Number(spec.w) || 1200);
+                    const h = Math.max(100, Number(spec.h) || 1200);
+                    const bg = String(spec.bg || '#334155');
+                    const label = String(spec.label || `TEST ${idx + 1}`).slice(0, 24);
+                    const svg = `<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><rect width="100%" height="100%" fill="${bg}"/><rect x="${Math.round(w * 0.08)}" y="${Math.round(h * 0.08)}" width="${Math.round(w * 0.84)}" height="${Math.round(h * 0.84)}" rx="28" fill="none" stroke="#ffffff" stroke-width="18"/><circle cx="${Math.round(w / 2)}" cy="${Math.round(h / 2)}" r="${Math.round(Math.min(w, h) * 0.18)}" fill="#ffffff" fill-opacity="0.28"/><text x="50%" y="50%" text-anchor="middle" dominant-baseline="middle" font-family="Arial, sans-serif" font-size="84" fill="#ffffff">${label}</text></svg>`;
+                    const blob = new Blob([svg], { type: 'image/svg+xml' });
+                    Object.defineProperty(blob, 'name', { value: String(spec.name || `debug-${idx + 1}.svg`) });
+                    return blob;
+                });
+                await handleFiles(files);
+                return true;
+            },
+            getLivePreviewMetrics() {
+                const parent = tshirt3d?.getBoundingClientRect();
+                return (state.layers || []).map((layer, idx) => {
+                    const rect = layer?.canvas?.getBoundingClientRect();
+                    if (!parent || !rect || !parent.width || !parent.height) return { idx, id: layer?.id || idx, missing: true };
+                    return {
+                        idx,
+                        id: layer?.id || idx,
+                        left: Number((((rect.left - parent.left) / parent.width) * 100).toFixed(2)),
+                        top: Number((((rect.top - parent.top) / parent.height) * 100).toFixed(2)),
+                        width: Number(((rect.width / parent.width) * 100).toFixed(2)),
+                        height: Number(((rect.height / parent.height) * 100).toFixed(2))
+                    };
+                });
+            },
+            getModalPreviewMetrics() {
+                const parent = productPreviewTshirt?.getBoundingClientRect();
+                return Array.from(productPreviewLayerStack?.querySelectorAll('.preview-modal-layer') || []).map((layer, idx) => {
+                    const rect = layer.getBoundingClientRect();
+                    if (!parent || !rect || !parent.width || !parent.height) return { idx, missing: true };
+                    return {
+                        idx,
+                        left: Number((((rect.left - parent.left) / parent.width) * 100).toFixed(2)),
+                        top: Number((((rect.top - parent.top) / parent.height) * 100).toFixed(2)),
+                        width: Number(((rect.width / parent.width) * 100).toFixed(2)),
+                        height: Number(((rect.height / parent.height) * 100).toFixed(2))
+                    };
+                });
+            },
+            async openPreviewAndMeasure() {
+                openProductPreviewModal();
+                await new Promise(resolve => setTimeout(resolve, 300));
+                return {
+                    live: this.getLivePreviewMetrics(),
+                    modal: this.getModalPreviewMetrics()
+                };
+            },
+            clearAll() {
+                resetDesigner();
+            }
+        };
+    }
     renderHomepageProducts();
     applyConversionCards();
     applyPreferredStartColor(true);

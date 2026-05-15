@@ -246,16 +246,13 @@ const NEB = (() => {
     },
 
     initTheme() {
-      const saved = localStorage.getItem('neb_theme');
-      if (saved === 'light') document.body.classList.add('theme-light');
+      document.body.classList.remove('theme-light');
+      try { localStorage.removeItem('neb_theme'); } catch {}
     },
 
-    setTheme(t) {
-      document.body.classList.toggle('theme-light', t === 'light');
-      localStorage.setItem('neb_theme', t);
-      document.querySelectorAll('.theme-switch button').forEach(b => {
-        b.classList.toggle('active', b.dataset.theme === t);
-      });
+    setTheme() {
+      document.body.classList.remove('theme-light');
+      try { localStorage.removeItem('neb_theme'); } catch {}
       if (window.NEB_CONFIG) this.applyBranding(window.NEB_CONFIG);
     },
 
@@ -319,8 +316,8 @@ const NEB = (() => {
       const sectionBg = sectionTone === 'FLAT'
         ? 'var(--bg)'
         : sectionTone === 'BOLD'
-          ? rgba(accent, document.body.classList.contains('theme-light') ? 0.14 : 0.1)
-          : rgba(accent, document.body.classList.contains('theme-light') ? 0.08 : 0.06);
+          ? rgba(accent, 0.1)
+          : rgba(accent, 0.06);
 
       setVar('--font-heading', headingFont);
       setVar('--font-body', bodyFont);
@@ -385,21 +382,8 @@ const NEB = (() => {
     paintThemeSwitch() {
       const slot = document.querySelector('[data-theme-switch]');
       if (!slot) return;
-      const cur = localStorage.getItem('neb_theme') === 'light' ? 'light' : 'dark';
-      slot.innerHTML = `
-        <div class="theme-switch" role="group" aria-label="Thema">
-          <button type="button" data-theme="dark" title="Donker" aria-label="Donker">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-          </button>
-          <button type="button" data-theme="light" title="Licht" aria-label="Licht">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
-          </button>
-        </div>`;
-      this.setTheme(cur);
-      slot.addEventListener('click', e => {
-        const b = e.target.closest('button[data-theme]');
-        if (b) this.setTheme(b.dataset.theme);
-      });
+      slot.innerHTML = '';
+      this.setTheme('dark');
     },
 
     async paintCart() {

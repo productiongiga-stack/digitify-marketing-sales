@@ -216,6 +216,22 @@ function extFromMime(mime) {
     'image/gif': 'gif'
   })[normalized] || 'bin';
 }
+function mimeFromExt(input) {
+  const ext = String(input || '').toLowerCase().replace(/^\./, '');
+  return ({
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    svg: 'image/svg+xml',
+    webp: 'image/webp',
+    avif: 'image/avif',
+    tiff: 'image/tiff',
+    tif: 'image/tiff',
+    gif: 'image/gif',
+    ico: 'image/x-icon',
+    pdf: 'application/pdf'
+  })[ext] || 'application/octet-stream';
+}
 function parseJsonField(value, fallback) {
   if (value == null || value === '') return fallback;
   if (typeof value === 'object') return value;
@@ -238,6 +254,88 @@ function normalizeUploadPath(input) {
   const absPath = path.join(UPLOAD_DIR, ...parts);
   if (!absPath.startsWith(UPLOAD_DIR)) return null;
   return { rel: parts.join('/'), abs: absPath, parts };
+}
+async function persistUploadBlob(relativePath, buffer, mime) {
+  const normalized = normalizeUploadPath(relativePath);
+  if (!normalized || !buffer?.length) return null;
+  await db.prepare(`
+    INSERT INTO upload_blobs(path, mime_type, data, size_bytes, created_at, updated_at)
+    VALUES(?, ?, ?, ?, datetime('now'), datetime('now'))
+    ON CONFLICT(path) DO UPDATE SET
+      mime_type = excluded.mime_type,
+      data = excluded.data,
+      size_bytes = excluded.size_bytes,
+      updated_at = datetime('now')
+  `).run(normalized.rel, String(mime || 'application/octet-stream'), buffer, Number(buffer.length) || 0);
+  return normalized;
+}
+async function loadUploadBlob(relativePath) {
+  const normalized = normalizeUploadPath(relativePath);
+  if (!normalized) return null;
+  const row = await db.prepare('SELECT path, mime_type, data, size_bytes, updated_at FROM upload_blobs WHERE path = ?').get(normalized.rel);
+  if (!row?.data) return null;
+  const buf = Buffer.isBuffer(row.data) ? row.data : Buffer.from(row.data);
+  return {
+    rel: normalized.rel,
+    abs: normalized.abs,
+    parts: normalized.parts,
+    buffer: buf,
+    mime: String(row.mime_type || mimeFromExt(path.extname(normalized.rel))),
+    sizeBytes: Number(row.size_bytes || buf.length || 0),
+    updatedAt: row.updated_at || null
+  };
+}
+async function removeUploadBlob(relativePath) {
+  const normalized = normalizeUploadPath(relativePath);
+  if (!normalized) return;
+  await db.prepare('DELETE FROM upload_blobs WHERE path = ?').run(normalized.rel);
+}
+async function writeStoredUpload(relativePath, buffer, mime) {
+  const normalized = normalizeUploadPath(relativePath);
+  if (!normalized || !buffer?.length) return null;
+  fs.mkdirSync(path.dirname(normalized.abs), { recursive: true });
+  fs.writeFileSync(normalized.abs, buffer);
+  await persistUploadBlob(normalized.rel, buffer, mime || mimeFromExt(path.extname(normalized.rel)));
+  return normalized;
+}
+async function readStoredUpload(relativePath) {
+  const normalized = normalizeUploadPath(relativePath);
+  if (!normalized) return null;
+  if (fs.existsSync(normalized.abs)) {
+    const buffer = fs.readFileSync(normalized.abs);
+    return {
+      rel: normalized.rel,
+      abs: normalized.abs,
+      parts: normalized.parts,
+      buffer,
+      mime: mimeFromExt(path.extname(normalized.rel)),
+      sizeBytes: buffer.length,
+      updatedAt: null
+    };
+  }
+  return loadUploadBlob(normalized.rel);
+}
+async function copyStoredUpload(sourcePath, targetPath, opts = {}) {
+  const source = await readStoredUpload(sourcePath);
+  if (!source?.buffer?.length) return null;
+  const target = await writeStoredUpload(targetPath, source.buffer, source.mime);
+  if (opts.removeSource) {
+    const sourceNormalized = normalizeUploadPath(sourcePath);
+    if (sourceNormalized?.abs) {
+      try { fs.rmSync(sourceNormalized.abs, { force: true }); } catch {}
+    }
+    await removeUploadBlob(sourcePath);
+  }
+  return target;
+}
+async function respondWithStoredUpload(res, relativePath, mode = 'private', expiresAt = null) {
+  const file = await readStoredUpload(relativePath);
+  if (!file?.buffer?.length) return false;
+  setUploadCacheHeaders(res, mode, expiresAt);
+  res.type(file.mime || 'application/octet-stream');
+  res.setHeader('Content-Length', String(file.buffer.length));
+  res.send(file.buffer);
+  return true;
 }
 async function canUserAccessUploadByParts(user, parts) {
   if (!user || !parts?.length) return false;
@@ -475,7 +573,7 @@ async function logAudit({ actorUserId = null, actorEmail = null, action, entityT
   if (details != null) {
     try { detailsJson = JSON.stringify(details); } catch { detailsJson = null; }
   }
-  await db.prepare(`INSERT INTO audit_log(actor_user_id, actor_email, action, entity_type, entity_id, summary, details)
+  await db.prepare(`INSERT INTO audit_log(user_id, user_email, action, entity_type, entity_id, summary, details)
               VALUES(?, ?, ?, ?, ?, ?, ?)`)
     .run(actorUserId, actorEmail || null, action, entityType, entityId == null ? null : String(entityId), summary, detailsJson);
 }
@@ -961,9 +1059,10 @@ function buildBrandedEmailHtml(innerHtml, subject, config = {}) {
 async function loadPdfLogoBuffer(config = {}) {
   const logoPath = config?.theme?.logoPath;
   const resolved = resolvePublicAssetAbs(logoPath);
-  if (!resolved) return null;
   try {
-    return await sharp(resolved.abs)
+    const input = resolved?.abs || (await readStoredUpload(logoPath))?.buffer;
+    if (!input) return null;
+    return await sharp(input)
       .rotate()
       .resize({ width: 420, height: 120, fit: 'inside', withoutEnlargement: true })
       .png({ compressionLevel: 9 })
@@ -2628,7 +2727,7 @@ app.post('/api/uploads/sign', requireAuth, async (req, res) => {
   const normalized = normalizeUploadPath(req.body?.path);
   if (!normalized) return res.status(400).json({ error: 'Ongeldig uploadpad' });
   if (!fs.existsSync(normalized.abs)) return res.status(404).json({ error: 'Bestand niet gevonden' });
-  if (!canUserAccessUploadByParts(req.user, normalized.parts)) return res.status(403).json({ error: 'Geen toegang tot dit bestand' });
+  if (!await canUserAccessUploadByParts(req.user, normalized.parts)) return res.status(403).json({ error: 'Geen toegang tot dit bestand' });
 
   const ttlRaw = Number(req.body?.ttlSeconds || 86400);
   const ttlSeconds = Math.max(60, Math.min(7 * 24 * 3600, Number.isFinite(ttlRaw) ? Math.floor(ttlRaw) : 86400));
@@ -2893,7 +2992,7 @@ app.post('/api/cart', requireAuth, cartUpload.fields([
     const optimized = await optimizeUploadedImage(previewFile.buffer, previewFile.mimetype || 'image/png', 'preview');
     const ext = optimized?.ext || extFromMime(previewFile.mimetype || 'image/png');
     previewPath = path.join('uploads', 'cart', String(itemId), `preview.${ext}`);
-    fs.writeFileSync(path.join(STORAGE_ROOT, previewPath), optimized?.buffer || previewFile.buffer);
+    await writeStoredUpload(previewPath, optimized?.buffer || previewFile.buffer, optimized?.mime || previewFile.mimetype || 'image/png');
     await db.prepare('UPDATE cart_items SET preview_path = ? WHERE id = ?').run(previewPath, itemId);
   } else {
     // Legacy JSON fallback (old clients)
@@ -2902,7 +3001,7 @@ app.post('/api/cart', requireAuth, cartUpload.fields([
       const optimized = await optimizeUploadedImage(previewBuf.buffer, previewBuf.mime || 'image/png', 'preview');
       const ext = optimized?.ext || extFromMime(previewBuf.mime || 'image/png');
       previewPath = path.join('uploads', 'cart', String(itemId), `preview.${ext}`);
-      fs.writeFileSync(path.join(STORAGE_ROOT, previewPath), optimized?.buffer || previewBuf.buffer);
+      await writeStoredUpload(previewPath, optimized?.buffer || previewBuf.buffer, optimized?.mime || previewBuf.mime || 'image/png');
       await db.prepare('UPDATE cart_items SET preview_path = ? WHERE id = ?').run(previewPath, itemId);
     }
   }
@@ -2920,14 +3019,14 @@ app.post('/api/cart', requireAuth, cartUpload.fields([
       const optimized = await optimizeUploadedImage(file.buffer, file.mimetype || 'image/png', 'design');
       const ext = optimized?.ext || extFromMime(file.mimetype || 'image/png');
       filePath = path.join('uploads', 'cart', String(itemId), `design-${idx + 1}.${ext}`);
-      fs.writeFileSync(path.join(STORAGE_ROOT, filePath), optimized?.buffer || file.buffer);
+      await writeStoredUpload(filePath, optimized?.buffer || file.buffer, optimized?.mime || file.mimetype || 'image/png');
     } else {
       const legacy = dataUrlToBuffer(d?.dataUrl);
       if (legacy) {
         const optimized = await optimizeUploadedImage(legacy.buffer, legacy.mime, 'design');
         const ext = optimized?.ext || extFromMime(legacy.mime);
         filePath = path.join('uploads', 'cart', String(itemId), `design-${idx + 1}.${ext}`);
-        fs.writeFileSync(path.join(STORAGE_ROOT, filePath), optimized?.buffer || legacy.buffer);
+        await writeStoredUpload(filePath, optimized?.buffer || legacy.buffer, optimized?.mime || legacy.mime || 'image/png');
       }
     }
     return filePath;
@@ -2976,14 +3075,23 @@ app.delete('/api/cart/:id', requireAuth, async (req, res) => {
   const id = Number(req.params.id);
   const item = await db.prepare('SELECT * FROM cart_items WHERE id = ? AND user_id = ?').get(id, req.user.id);
   if (!item) return res.status(404).json({ error: 'Item niet gevonden' });
+  const designs = await db.prepare('SELECT file_path FROM cart_item_designs WHERE cart_item_id = ?').all(id);
   await db.prepare('DELETE FROM cart_items WHERE id = ?').run(id);
+  if (item.preview_path) await removeUploadBlob(item.preview_path);
+  for (const d of designs) if (d?.file_path) await removeUploadBlob(d.file_path);
   fs.rmSync(path.join(CART_DIR, String(id)), { recursive: true, force: true });
   res.json({ ok: true });
 });
 
 app.delete('/api/cart', requireAuth, async (req, res) => {
   const items = await db.prepare('SELECT id FROM cart_items WHERE user_id = ?').all(req.user.id);
+  const ids = items.map(i => i.id).filter(Boolean);
+  const placeholders = ids.map(() => '?').join(',');
+  const previews = ids.length ? await db.prepare(`SELECT preview_path FROM cart_items WHERE id IN (${placeholders})`).all(...ids) : [];
+  const designs = ids.length ? await db.prepare(`SELECT file_path FROM cart_item_designs WHERE cart_item_id IN (${placeholders})`).all(...ids) : [];
   await db.prepare('DELETE FROM cart_items WHERE user_id = ?').run(req.user.id);
+  for (const row of previews) if (row?.preview_path) await removeUploadBlob(row.preview_path);
+  for (const row of designs) if (row?.file_path) await removeUploadBlob(row.file_path);
   items.forEach(i => fs.rmSync(path.join(CART_DIR, String(i.id)), { recursive: true, force: true }));
   res.json({ ok: true });
 });
@@ -3049,41 +3157,31 @@ app.post('/api/orders', requireAuth, async (req, res) => {
       Number(item.product_price_multiplier) || 1);
     const itemId = r2.lastInsertRowid;
 
-    // Move preview (only in non-PG mode where filesystem is persistent)
+    // Persist preview into an order-owned path so previews remain available after cart cleanup.
     let newPreview = null;
-    if (!USE_PG && item.preview_path) {
-      const orderItemDir = path.join(ORDER_DIR, String(orderId), String(itemId));
-      fs.mkdirSync(orderItemDir, { recursive: true });
-      const src = path.join(STORAGE_ROOT, item.preview_path);
-      if (fs.existsSync(src)) {
-        const ext = path.extname(item.preview_path) || '.png';
-        newPreview = path.join('uploads', 'orders', String(orderId), String(itemId), `preview${ext}`);
-        fs.renameSync(src, path.join(STORAGE_ROOT, newPreview));
-      }
+    if (item.preview_path) {
+      const ext = path.extname(item.preview_path) || '.png';
+      newPreview = path.join('uploads', 'orders', String(orderId), String(itemId), `preview${ext}`);
+      const movedPreview = await copyStoredUpload(item.preview_path, newPreview, { removeSource: true });
+      newPreview = movedPreview ? newPreview : null;
     }
     if (newPreview) await db.prepare('UPDATE order_items SET preview_path = ? WHERE id = ?').run(newPreview, itemId);
 
     for (let i = 0; i < item.designs.length; i++) {
       const d = item.designs[i];
       let newFile = null;
-      if (!USE_PG && d.file_path) {
-        const orderItemDir = path.join(ORDER_DIR, String(orderId), String(itemId));
-        fs.mkdirSync(orderItemDir, { recursive: true });
-        const src = path.join(STORAGE_ROOT, d.file_path);
-        if (fs.existsSync(src)) {
-          const ext = path.extname(d.file_path) || '.png';
-          newFile = path.join('uploads', 'orders', String(orderId), String(itemId), `design-${i + 1}${ext}`);
-          fs.renameSync(src, path.join(STORAGE_ROOT, newFile));
-        }
+      if (d.file_path) {
+        const ext = path.extname(d.file_path) || '.png';
+        newFile = path.join('uploads', 'orders', String(orderId), String(itemId), `design-${i + 1}${ext}`);
+        const movedDesign = await copyStoredUpload(d.file_path, newFile, { removeSource: true });
+        newFile = movedDesign ? newFile : null;
       }
       await db.prepare(`INSERT INTO order_designs(order_item_id, name, position, scale, v_offset, x_offset, note, file_path)
         VALUES(?, ?, ?, ?, ?, ?, ?, ?)`).run(itemId, d.name, d.position, d.scale, d.v_offset, d.x_offset, d.note || '', newFile || d.file_path);
     }
 
     // Cleanup leftover cart dir
-    if (!USE_PG) {
-      try { fs.rmSync(path.join(CART_DIR, String(item.id)), { recursive: true, force: true }); } catch {}
-    }
+    try { fs.rmSync(path.join(CART_DIR, String(item.id)), { recursive: true, force: true }); } catch {}
   }
 
   await db.prepare('DELETE FROM cart_items WHERE user_id = ?').run(req.user.id);
@@ -3170,7 +3268,7 @@ app.get('/api/orders/:id', requireAuth, async (req, res) => {
                                       paid_at, failure_reason, created_at, updated_at
                                FROM payments WHERE order_id = ?
                                ORDER BY id DESC`).all(id);
-  const emailTracking = isStaff ? getEmailTrackingForOrder(id) : [];
+  const emailTracking = isStaff ? await getEmailTrackingForOrder(id) : [];
   const depositInvoices = isStaff
     ? await db.prepare(`SELECT id, order_id, linked_final_invoice_id, invoice_number, status, deposit_percentage, deposit_amount,
                          issue_date, due_date, sent_at, paid_at, created_at, updated_at
@@ -4151,7 +4249,7 @@ app.get('/api/admin/orders/:id/deposit-invoice.pdf', requireAuth, requireRole('A
     if (isOrderArchived(order)) return res.status(400).json({ error: 'Order is gearchiveerd. Zet eerst terug.' });
     const depositInvoice = await getLatestDepositInvoiceByOrderId(orderId);
     if (!depositInvoice) return res.status(404).json({ error: 'Geen voorschotfactuur gevonden' });
-    const finalInvoice = ensureInvoiceForOrder(orderId, await getConfig()) || getInvoiceByOrderId(orderId);
+    const finalInvoice = await ensureInvoiceForOrder(orderId, await getConfig()) || await getInvoiceByOrderId(orderId);
     const pdf = await generateDepositInvoicePdfBuffer({ order, depositInvoice, finalInvoice }, await getConfig());
     const fileNo = depositInvoice.invoice_number || buildDepositInvoiceNumber(depositInvoice.id || 0);
     const name = safeFilename(`voorschotfactuur-${fileNo}.pdf`);
@@ -4715,7 +4813,7 @@ app.post('/api/admin/branding/upload', requireAuth, requireRole('OWNER'), brandi
   try {
     const fileSuffix = crypto.randomBytes(4).toString('hex');
     const outName = `${kind}-${Date.now()}-${fileSuffix}.png`;
-    const outAbs = path.join(BRAND_ASSET_DIR, outName);
+    const relPath = `assets/branding/${outName}`;
 
     let pipeline = sharp(req.file.buffer, { failOn: 'none' }).rotate();
     if (kind === 'logo') {
@@ -4731,8 +4829,7 @@ app.post('/api/admin/branding/upload', requireAuth, requireRole('OWNER'), brandi
     }
 
     const optimized = await pipeline.png({ compressionLevel: 9, quality: 90 }).toBuffer();
-    fs.writeFileSync(outAbs, optimized);
-    const relPath = `assets/branding/${outName}`;
+    await writeStoredUpload(relPath, optimized, 'image/png');
 
     await logAuditFromReq(req, {
       action: 'CONFIG_UPDATED',
@@ -4759,7 +4856,7 @@ app.post('/api/admin/products/mockup', requireAuth, requireRole('OWNER', 'ADMIN'
   try {
     const fileSuffix = crypto.randomBytes(4).toString('hex');
     const outName = `mockup-${Date.now()}-${fileSuffix}.png`;
-    const outAbs = path.join(PRODUCT_ASSET_DIR, outName);
+    const relPath = `assets/products/${outName}`;
     const optimized = await sharp(req.file.buffer, { failOn: 'none' })
       .rotate()
       .resize({
@@ -4770,8 +4867,7 @@ app.post('/api/admin/products/mockup', requireAuth, requireRole('OWNER', 'ADMIN'
       })
       .png({ compressionLevel: 9, quality: 90 })
       .toBuffer();
-    fs.writeFileSync(outAbs, optimized);
-    const relPath = `assets/products/${outName}`;
+    await writeStoredUpload(relPath, optimized, 'image/png');
 
     await logAuditFromReq(req, {
       action: 'CONFIG_UPDATED',
@@ -4954,7 +5050,7 @@ app.get('/api/admin/audit', requireAuth, requireRole('OWNER'), async (req, res) 
   let where = '1=1';
   const params = {};
   if (q) {
-    where += ` AND (summary LIKE @q OR actor_email LIKE @q OR entity_type LIKE @q OR action LIKE @q)`;
+    where += ` AND (summary LIKE @q OR user_email LIKE @q OR entity_type LIKE @q OR action LIKE @q)`;
     params.q = `%${q}%`;
   }
   if (action) {
@@ -4964,7 +5060,7 @@ app.get('/api/admin/audit', requireAuth, requireRole('OWNER'), async (req, res) 
 
   const total = (await db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE ${where}`).get(params)).c;
   const logs = await db.prepare(`
-    SELECT id, actor_user_id, actor_email, action, entity_type, entity_id, summary, details, created_at
+    SELECT id, user_id AS actor_user_id, user_email AS actor_email, action, entity_type, entity_id, summary, details, created_at
     FROM audit_log
     WHERE ${where}
     ORDER BY id DESC
@@ -5083,12 +5179,9 @@ app.post('/api/admin/products/:productId/colors/:hex/mockup',
       // Sla mockup op in branding-map
       const ext = extFromMime(req.file.mimetype || 'image/png');
       const safeName = `product-${productId}-color-${hexRaw.replace('#', '')}.${ext}`;
-      const destPath = path.join(BRAND_ASSET_DIR, safeName);
-      fs.mkdirSync(BRAND_ASSET_DIR, { recursive: true });
-
       const optimized = await optimizeUploadedImage(req.file.buffer, req.file.mimetype || 'image/png', 'mockup');
-      fs.writeFileSync(destPath, optimized?.buffer || req.file.buffer);
       const relativePath = path.join('assets', 'branding', safeName);
+      await writeStoredUpload(relativePath, optimized?.buffer || req.file.buffer, optimized?.mime || req.file.mimetype || 'image/png');
 
       // Update config
       const updatedProducts = products.map((p, i) => {
@@ -5273,35 +5366,42 @@ app.get('/uploads-signed', async (req, res) => {
   if (!normalized) return res.status(400).end();
   const expected = signUploadPayload(normalized.rel, exp);
   if (!safeSigEqual(sig, expected)) return res.status(403).end();
-  if (!fs.existsSync(normalized.abs)) return res.status(404).end();
-
-  setUploadCacheHeaders(res, 'signed', exp * 1000);
-  res.sendFile(normalized.abs);
+  if (fs.existsSync(normalized.abs)) {
+    setUploadCacheHeaders(res, 'signed', exp * 1000);
+    return res.sendFile(normalized.abs);
+  }
+  if (await respondWithStoredUpload(res, normalized.rel, 'signed', exp * 1000)) return;
+  return res.status(404).end();
 });
 
 app.get('/uploads/*', async (req, res) => {
   const u = await currentUser(req);
   if (!u) return res.status(401).end();
   const normalized = normalizeUploadPath(req.params[0]);
-  if (!normalized || !fs.existsSync(normalized.abs)) return res.status(404).end();
-  if (!canUserAccessUploadByParts(u, normalized.parts)) return res.status(403).end();
-
-  setUploadCacheHeaders(res, 'private');
-  res.sendFile(normalized.abs);
+  if (!normalized) return res.status(404).end();
+  if (!await canUserAccessUploadByParts(u, normalized.parts)) return res.status(403).end();
+  if (fs.existsSync(normalized.abs)) {
+    setUploadCacheHeaders(res, 'private');
+    return res.sendFile(normalized.abs);
+  }
+  if (await respondWithStoredUpload(res, normalized.rel, 'private')) return;
+  return res.status(404).end();
 });
 
-// In PG/Vercel mode, branding/product assets are written to writable storage (/tmp/uploads/assets/*).
-// This route serves those dynamic assets and falls back to static public assets if not found.
+// Branding/product assets can exist in public assets, runtime uploads, or the blob store.
+// This route serves runtime/blob-backed assets and falls back to static public assets if not found.
 app.get('/assets/*', async (req, res, next) => {
-  if (!USE_WRITABLE_TMP) return next();
   const rel = normalizePublicAssetPath(req.path);
   if (!rel || (!rel.startsWith('assets/branding/') && !rel.startsWith('assets/products/'))) return next();
   const abs = path.resolve(UPLOAD_DIR, rel);
   const allowedRoot = path.resolve(UPLOAD_DIR, 'assets');
   if (!abs.startsWith(allowedRoot + path.sep) && abs !== allowedRoot) return res.status(400).end();
-  if (!fs.existsSync(abs)) return next();
-  res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300, stale-while-revalidate=300');
-  return res.sendFile(abs);
+  if (fs.existsSync(abs)) {
+    res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300, stale-while-revalidate=300');
+    return res.sendFile(abs);
+  }
+  if (await respondWithStoredUpload(res, rel, 'signed', Date.now() + (300 * 1000))) return;
+  return next();
 });
 
 app.get('/', async (_req, res) => {

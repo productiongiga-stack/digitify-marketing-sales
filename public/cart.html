@@ -35,27 +35,27 @@
 
   <main class="app-shell">
     <div class="app-main">
-      <div class="checkout-progress">
-        <div class="cp-step active">
+      <div class="checkout-progress" id="checkoutProgress">
+        <div class="cp-step active" data-step="1">
           <div class="cp-num">1</div>
           <span>Winkelmand</span>
         </div>
         <div class="cp-line"></div>
-        <div class="cp-step">
+        <div class="cp-step" data-step="2">
           <div class="cp-num">2</div>
           <span>Adres</span>
         </div>
         <div class="cp-line"></div>
-        <div class="cp-step">
+        <div class="cp-step" data-step="3">
           <div class="cp-num">3</div>
           <span>Betaling</span>
         </div>
       </div>
 
       <div class="page-head">
-        <span class="page-eyebrow">Stap 1 van 3</span>
-        <h1 class="page-title">Jouw winkelmand</h1>
-        <p class="page-sub">Bekijk je ontwerpen, pas aantallen aan en ga verder naar het adres.</p>
+        <span class="page-eyebrow" id="checkoutEyebrow">Stap 1 van 3</span>
+        <h1 class="page-title" id="checkoutTitle">Jouw winkelmand</h1>
+        <p class="page-sub" id="checkoutSub">Bekijk je ontwerpen, pas aantallen aan en ga verder naar het adres.</p>
       </div>
 
       <div id="cartWrap"></div>
@@ -69,41 +69,103 @@
       if (!user) return;
       window.NEB_USER = user;
       await NEB.paintNav();
-      await render();
 
-      async function render() {
-        const wrap = document.getElementById('cartWrap');
-        const [{ items }, cfg] = await Promise.all([NEB.get('/api/cart'), NEB.config()]);
+      const checkoutState = {
+        step: 1,
+        items: [],
+        config: null,
+        customer: {
+          firstName: user.firstName || '',
+          lastName: user.lastName || '',
+          email: user.email || '',
+          company: user.company || '',
+          vatNumber: user.vatNumber || '',
+          address: user.address || '',
+          postcode: user.postcode || '',
+          city: user.city || '',
+          phone: user.phone || ''
+        },
+        saveAddress: true
+      };
 
-        if (!items.length) {
-          wrap.innerHTML = `
-            <div class="cart-empty">
-              <h3>Je winkelmand is leeg</h3>
-              <p class="muted">Ga naar de designer en voeg een eerste ontwerp toe.</p>
-              <p style="margin-top:1.5rem"><a href="/" class="btn btn-primary">Start met ontwerpen</a></p>
-            </div>`;
-          return;
+      const wrap = document.getElementById('cartWrap');
+      const progressEl = document.getElementById('checkoutProgress');
+      const eyebrowEl = document.getElementById('checkoutEyebrow');
+      const titleEl = document.getElementById('checkoutTitle');
+      const subEl = document.getElementById('checkoutSub');
+
+      const stepCopy = {
+        1: {
+          eyebrow: 'Stap 1 van 3',
+          title: 'Jouw winkelmand',
+          sub: 'Controleer je items, aantallen en totaal voordat we je adres vragen.'
+        },
+        2: {
+          eyebrow: 'Stap 2 van 3',
+          title: 'Bezorgadres',
+          sub: 'Vul je gegevens in zodat we je bestelling correct kunnen verwerken en opvolgen.'
+        },
+        3: {
+          eyebrow: 'Stap 3 van 3',
+          title: 'Betaling & bevestiging',
+          sub: 'Controleer nog één keer alles. Na je bestelling ontvang je je verdere betaalinstructies.'
         }
+      };
 
-        const subtotal = items.reduce((s, i) => s + (i.total || 0), 0);
+      async function refreshData() {
+        const [{ items }, cfg] = await Promise.all([NEB.get('/api/cart'), NEB.config()]);
+        checkoutState.items = Array.isArray(items) ? items : [];
+        checkoutState.config = cfg || {};
+      }
+
+      function captureCustomer() {
+        const fields = ['firstName','lastName','email','company','vatNumber','address','postcode','city','phone'];
+        fields.forEach((field) => {
+          const input = document.getElementById('ck_' + field);
+          if (input) checkoutState.customer[field] = String(input.value || '').trim();
+        });
+        const save = document.getElementById('ck_save');
+        if (save) checkoutState.saveAddress = !!save.checked;
+      }
+
+      function validateCustomer() {
+        captureCustomer();
+        const required = ['firstName','lastName','email','address','postcode','city'];
+        for (const key of required) {
+          if (!checkoutState.customer[key]) {
+            NEB.toast('Vul alle verplichte adresvelden in', 'error');
+            document.getElementById('ck_' + key)?.focus();
+            return false;
+          }
+        }
+        return true;
+      }
+
+      function syncChrome() {
+        const copy = stepCopy[checkoutState.step] || stepCopy[1];
+        eyebrowEl.textContent = copy.eyebrow;
+        titleEl.textContent = copy.title;
+        subEl.textContent = copy.sub;
+        progressEl.querySelectorAll('.cp-step').forEach((stepEl) => {
+          const num = Number(stepEl.dataset.step || 0);
+          stepEl.classList.toggle('active', num === checkoutState.step);
+          stepEl.classList.toggle('done', num < checkoutState.step);
+        });
+      }
+
+      function getPricingMeta() {
+        const items = checkoutState.items;
+        const cfg = checkoutState.config || {};
         const pricing = cfg.pricing || {};
         const conversion = cfg.conversion || {};
-        const ctaVariant = String(conversion.ctaVariant || 'SOFT').toUpperCase() === 'STRONG' ? 'STRONG' : 'SOFT';
+        const subtotal = items.reduce((sum, item) => sum + (Number(item.total) || 0), 0);
         const shippingCost = Math.max(0, Number(pricing.shippingCost || 0));
         const shippingFreeEnabled = !!pricing.shippingFree;
         const shippingThreshold = Math.max(0, Number(pricing.shippingFreeThreshold || 0));
         const qualifiesFreeShipping = shippingFreeEnabled && (shippingThreshold <= 0 || subtotal >= shippingThreshold);
         const shipping = shippingCost <= 0 ? 0 : (qualifiesFreeShipping ? 0 : shippingCost);
         const total = subtotal + shipping;
-        const shippingLabel = shipping === 0
-          ? ((shippingCost > 0 && qualifiesFreeShipping) ? '<span class="free-tag">GRATIS</span>' : NEB.fmtEUR(0))
-          : NEB.fmtEUR(shipping);
-        const remainingForFree = shippingFreeEnabled && shippingThreshold > 0
-          ? Math.max(0, shippingThreshold - subtotal)
-          : 0;
-        const checkoutCtaBase = ctaVariant === 'STRONG'
-          ? String(conversion.cartCtaStrong || 'Bestelling plaatsen').trim()
-          : String(conversion.cartCtaSoft || 'Bestelling plaatsen (nog niet betalen)').trim();
+        const ctaVariant = String(conversion.ctaVariant || 'SOFT').toUpperCase() === 'STRONG' ? 'STRONG' : 'SOFT';
         const checkoutNote = String(conversion.checkoutNote || 'Na goedkeuring ontvang je je beveiligde betaallink per e-mail.').trim();
         const socialEnabled = conversion.socialProofEnabled !== false;
         const socialText = String(conversion.socialProofText || 'Gemiddelde goedkeuring op werkdagen: binnen 2 uur.').trim();
@@ -113,128 +175,244 @@
           'Statusupdates in dashboard + mail'
         ];
         if (socialEnabled && socialText) trustItems.push(socialText);
+        return {
+          subtotal,
+          shipping,
+          total,
+          trustItems,
+          checkoutNote,
+          deliveryText: String(cfg.pricing?.deliveryText || '3 werkdagen'),
+          remainingForFree: shippingFreeEnabled && shippingThreshold > 0 ? Math.max(0, shippingThreshold - subtotal) : 0,
+          qualifiesFreeShipping,
+          shippingCost
+        };
+      }
 
-        wrap.innerHTML = `
-          <div class="cart-grid">
-            <div class="cart-list">
-              ${items.map(i => `
-                <div class="cart-item" data-id="${i.id}">
-                  ${i.preview_path
-                    ? `<img class="ci-thumb" src="/${i.preview_path}" alt="">`
-                    : `<div class="ci-thumb"></div>`}
-                  <div class="ci-meta">
-                    <h4>${i.color_hex ? `<span class="swatch-dot" style="background:${i.color_hex}"></span>` : ''}${escapeHtml(i.product_label || 'Product')} — ${escapeHtml(i.color_name || '—')}</h4>
-                    <small>Maat ${i.size} · ${i.designs.length} ontwerp${i.designs.length === 1 ? '' : 'en'} · €${(i.unit_price + i.extras_price).toFixed(2).replace('.', ',')} per stuk${i.product_price_multiplier && Number(i.product_price_multiplier) !== 1 ? ` · factor x${Number(i.product_price_multiplier).toFixed(2)}` : ''}</small>
+      function renderItemList(interactive) {
+        return `
+          <div class="cart-list">
+            ${checkoutState.items.map(i => `
+              <div class="cart-item" data-id="${i.id}">
+                ${i.preview_path
+                  ? `<img class="ci-thumb" src="/${i.preview_path}" alt="">`
+                  : `<div class="ci-thumb"></div>`}
+                <div class="ci-meta">
+                  <h4>${i.color_hex ? `<span class="swatch-dot" style="background:${i.color_hex}"></span>` : ''}${escapeHtml(i.product_label || 'Product')} — ${escapeHtml(i.color_name || '—')}</h4>
+                  <small>Maat ${escapeHtml(i.size || '—')} · ${i.designs.length} ontwerp${i.designs.length === 1 ? '' : 'en'} · €${(Number(i.unit_price || 0) + Number(i.extras_price || 0)).toFixed(2).replace('.', ',')} per stuk${i.product_price_multiplier && Number(i.product_price_multiplier) !== 1 ? ` · factor x${Number(i.product_price_multiplier).toFixed(2)}` : ''}</small>
+                  ${interactive ? `
                     <div class="ci-qty" data-qty="${i.id}">
                       <button data-q="-1" aria-label="Verminder">&minus;</button>
                       <span>${i.qty}</span>
                       <button data-q="+1" aria-label="Verhoog">+</button>
-                    </div>
-                  </div>
-                  <div class="ci-actions">
-                    <div class="ci-price">${NEB.fmtEUR(i.total)}</div>
-                    <button class="ci-remove" data-remove="${i.id}">Verwijder</button>
-                  </div>
+                    </div>` : `<div class="ci-detail-row">Aantal <strong>${i.qty}</strong></div>`}
                 </div>
-              `).join('')}
-            </div>
-
-            <aside class="cart-summary">
-              <h3>Overzicht</h3>
-              <div class="sum-line"><span>Subtotaal</span><span>${NEB.fmtEUR(subtotal)}</span></div>
-              <div class="sum-line"><span>Verzending</span><span>${shippingLabel}</span></div>
-              <div class="sum-line total"><span>Totaal</span><span>${NEB.fmtEUR(total)}</span></div>
-              ${remainingForFree > 0 ? `<p class="muted compact" style="margin:.55rem 0 0">Nog <strong>${NEB.fmtEUR(remainingForFree)}</strong> voor gratis verzending.</p>` : ''}
-
-              <div style="margin:1.25rem 0 .5rem">
-                <h3 style="margin-bottom:.65rem">Bezorgadres</h3>
-                <div class="form-stack">
-                  <div class="form-grid-2">
-                    <div class="field"><label>Voornaam</label><input id="ck_firstName" value="${esc(user.firstName)}"></div>
-                    <div class="field"><label>Achternaam</label><input id="ck_lastName" value="${esc(user.lastName)}"></div>
-                  </div>
-                  <div class="field"><label>E-mail</label><input id="ck_email" value="${esc(user.email)}"></div>
-                  <div class="field"><label>Bedrijf (optioneel)</label><input id="ck_company" placeholder="Bedrijfsnaam"></div>
-                  <div class="field"><label>Klant BTW (optioneel)</label><input id="ck_vat" placeholder="BE0123.456.789"></div>
-                  <div class="field"><label>Adres</label><input id="ck_address" value="${esc(user.address)}"></div>
-                  <div class="form-grid-2">
-                    <div class="field"><label>Postcode</label><input id="ck_postcode" value="${esc(user.postcode)}"></div>
-                    <div class="field"><label>Stad</label><input id="ck_city" value="${esc(user.city)}"></div>
-                  </div>
-                  <div class="field"><label>Telefoon (optioneel)</label><input id="ck_phone" value="${esc(user.phone)}"></div>
-                  <label style="display:flex;align-items:center;gap:.5rem;font-size:.85rem;color:var(--text-2)">
-                    <input type="checkbox" id="ck_save" checked> Adres opslaan voor volgende keer
-                  </label>
+                <div class="ci-actions">
+                  <div class="ci-price">${NEB.fmtEUR(i.total)}</div>
+                  ${interactive ? `<button class="ci-remove" data-remove="${i.id}">Verwijder</button>` : ''}
                 </div>
               </div>
-
-              <button class="btn btn-primary btn-block" id="checkoutBtn" style="margin-top:.5rem">
-                ${escapeHtml(checkoutCtaBase)} — ${NEB.fmtEUR(total)}
-              </button>
-              <div class="checkout-trust">
-                ${trustItems.map(t => `<span>${escapeHtml(t)}</span>`).join('')}
-              </div>
-              <p class="muted compact" style="text-align:center;margin-top:.6rem">Levertijd: ${escapeHtml(cfg.pricing?.deliveryText || '3 werkdagen')} · ${escapeHtml(checkoutNote)}</p>
-              <p style="margin-top:.55rem"><a href="/" class="btn btn-ghost btn-sm" style="width:100%">Nog een ontwerp toevoegen</a></p>
-            </aside>
+            `).join('')}
           </div>`;
-
-        wrap.addEventListener('click', onClick);
-        document.getElementById('checkoutBtn').addEventListener('click', placeOrder);
       }
 
-      async function onClick(e) {
-        const removeId = e.target.dataset?.remove;
-        const qtyBtn = e.target.closest('[data-q]');
-        if (removeId) {
-          if (!confirm('Item verwijderen uit winkelmand?')) return;
-          try {
-            await NEB.del('/api/cart/' + removeId);
-            NEB.toast('Verwijderd');
-            await render();
-            await NEB.paintCart();
-          } catch (err) { NEB.toast(err.message, 'error'); }
+      function renderSummary(meta, ctaHtml = '', includeTrust = true) {
+        const shippingLabel = meta.shipping === 0
+          ? ((meta.shippingCost > 0 && meta.qualifiesFreeShipping) ? '<span class="free-tag">GRATIS</span>' : NEB.fmtEUR(0))
+          : NEB.fmtEUR(meta.shipping);
+        return `
+          <aside class="cart-summary">
+            <h3>Overzicht</h3>
+            <div class="sum-line"><span>Subtotaal</span><span>${NEB.fmtEUR(meta.subtotal)}</span></div>
+            <div class="sum-line"><span>Verzending</span><span>${shippingLabel}</span></div>
+            <div class="sum-line total"><span>Totaal</span><span>${NEB.fmtEUR(meta.total)}</span></div>
+            ${meta.remainingForFree > 0 ? `<p class="muted compact" style="margin:.55rem 0 0">Nog <strong>${NEB.fmtEUR(meta.remainingForFree)}</strong> voor gratis verzending.</p>` : ''}
+            ${ctaHtml}
+            ${includeTrust ? `<div class="checkout-trust">${meta.trustItems.map(t => `<span>${escapeHtml(t)}</span>`).join('')}</div>` : ''}
+            <p class="muted compact" style="text-align:center;margin-top:.6rem">Levertijd: ${escapeHtml(meta.deliveryText)} · ${escapeHtml(meta.checkoutNote)}</p>
+          </aside>`;
+      }
+
+      function renderAddressForm() {
+        const customer = checkoutState.customer;
+        return `
+          <div class="card" style="padding:1.2rem 1.25rem">
+            <h3 class="card-title" style="margin-bottom:1rem">Bezorgadres</h3>
+            <div class="form-stack">
+              <div class="form-grid-2">
+                <div class="field"><label>Voornaam</label><input id="ck_firstName" value="${esc(customer.firstName)}"></div>
+                <div class="field"><label>Achternaam</label><input id="ck_lastName" value="${esc(customer.lastName)}"></div>
+              </div>
+              <div class="field"><label>E-mail</label><input id="ck_email" value="${esc(customer.email)}"></div>
+              <div class="field"><label>Bedrijf (optioneel)</label><input id="ck_company" value="${esc(customer.company)}" placeholder="Bedrijfsnaam"></div>
+              <div class="field"><label>Klant BTW (optioneel)</label><input id="ck_vatNumber" value="${esc(customer.vatNumber)}" placeholder="BE0123.456.789"></div>
+              <div class="field"><label>Adres</label><input id="ck_address" value="${esc(customer.address)}"></div>
+              <div class="form-grid-2">
+                <div class="field"><label>Postcode</label><input id="ck_postcode" value="${esc(customer.postcode)}"></div>
+                <div class="field"><label>Stad</label><input id="ck_city" value="${esc(customer.city)}"></div>
+              </div>
+              <div class="field"><label>Telefoon (optioneel)</label><input id="ck_phone" value="${esc(customer.phone)}"></div>
+              <label class="field-check">
+                <input type="checkbox" id="ck_save" ${checkoutState.saveAddress ? 'checked' : ''}> Adres opslaan voor volgende keer
+              </label>
+            </div>
+          </div>`;
+      }
+
+      function renderAddressReview(meta) {
+        const c = checkoutState.customer;
+        return `
+          <div class="card" style="padding:1.2rem 1.25rem">
+            <h3 class="card-title" style="margin-bottom:1rem">Controle</h3>
+            <div class="kv-list">
+              <div class="kv"><span class="kv-key">Naam</span><span class="kv-val">${escapeHtml(`${c.firstName} ${c.lastName}`.trim() || '—')}</span></div>
+              <div class="kv"><span class="kv-key">E-mail</span><span class="kv-val">${escapeHtml(c.email || '—')}</span></div>
+              ${c.company ? `<div class="kv"><span class="kv-key">Bedrijf</span><span class="kv-val">${escapeHtml(c.company)}</span></div>` : ''}
+              ${c.vatNumber ? `<div class="kv"><span class="kv-key">BTW</span><span class="kv-val">${escapeHtml(c.vatNumber)}</span></div>` : ''}
+              <div class="kv"><span class="kv-key">Adres</span><span class="kv-val">${escapeHtml([c.address, [c.postcode, c.city].filter(Boolean).join(' ')].filter(Boolean).join(', ') || '—')}</span></div>
+              ${c.phone ? `<div class="kv"><span class="kv-key">Telefoon</span><span class="kv-val">${escapeHtml(c.phone)}</span></div>` : ''}
+              <div class="kv"><span class="kv-key">Totaal</span><span class="kv-val"><strong>${NEB.fmtEUR(meta.total)}</strong></span></div>
+            </div>
+          </div>`;
+      }
+
+      function renderNavActions(actions) {
+        return `<div class="checkout-nav-actions">${actions.join('')}</div>`;
+      }
+
+      function render() {
+        syncChrome();
+        const meta = getPricingMeta();
+
+        if (!checkoutState.items.length) {
+          wrap.innerHTML = `
+            <div class="cart-empty">
+              <h3>Je winkelmand is leeg</h3>
+              <p class="muted">Ga naar de designer en voeg een eerste ontwerp toe.</p>
+              <p style="margin-top:1.5rem"><a href="/" class="btn btn-primary">Start met ontwerpen</a></p>
+            </div>`;
           return;
         }
-        if (qtyBtn) {
-          const wrap = qtyBtn.closest('[data-qty]');
-          const id = wrap.dataset.qty;
-          const span = wrap.querySelector('span');
-          const cur = Number(span.textContent) || 1;
-          const next = Math.max(1, Math.min(99, cur + Number(qtyBtn.dataset.q)));
-          if (next === cur) return;
-          try {
-            await NEB.put('/api/cart/' + id, { qty: next });
-            await render();
-            await NEB.paintCart();
-          } catch (err) { NEB.toast(err.message, 'error'); }
+
+        if (checkoutState.step === 1) {
+          wrap.innerHTML = `
+            <div class="cart-grid">
+              ${renderItemList(true)}
+              ${renderSummary(meta, `
+                <button class="btn btn-primary btn-block" id="continueToAddress" style="margin-top:1rem">Verder naar adres — ${NEB.fmtEUR(meta.total)}</button>
+                <p style="margin-top:.55rem"><a href="/" class="btn btn-ghost btn-sm" style="width:100%">Nog een ontwerp toevoegen</a></p>
+              `)}
+            </div>`;
+          wrap.querySelector('#continueToAddress')?.addEventListener('click', () => {
+            checkoutState.step = 2;
+            render();
+          });
+        } else if (checkoutState.step === 2) {
+          wrap.innerHTML = `
+            <div class="cart-grid">
+              <div class="checkout-step-shell">
+                ${renderAddressForm()}
+                ${renderNavActions([
+                  '<button class="btn btn-ghost" id="backToCart">Terug naar winkelmand</button>',
+                  '<button class="btn btn-primary" id="continueToPayment">Verder naar betaling</button>'
+                ])}
+              </div>
+              ${renderSummary(meta, '', false)}
+            </div>`;
+          wrap.querySelector('#backToCart')?.addEventListener('click', () => {
+            captureCustomer();
+            checkoutState.step = 1;
+            render();
+          });
+          wrap.querySelector('#continueToPayment')?.addEventListener('click', () => {
+            if (!validateCustomer()) return;
+            checkoutState.step = 3;
+            render();
+          });
+        } else {
+          wrap.innerHTML = `
+            <div class="cart-grid">
+              <div class="checkout-step-shell">
+                ${renderItemList(false)}
+                ${renderAddressReview(meta)}
+                ${renderNavActions([
+                  '<button class="btn btn-ghost" id="backToAddress">Adres aanpassen</button>',
+                  `<button class="btn btn-primary" id="checkoutBtn">Bestelling plaatsen — ${NEB.fmtEUR(meta.total)}</button>`
+                ])}
+              </div>
+              ${renderSummary(meta, '', true)}
+            </div>`;
+          wrap.querySelector('#backToAddress')?.addEventListener('click', () => {
+            checkoutState.step = 2;
+            render();
+          });
+          wrap.querySelector('#checkoutBtn')?.addEventListener('click', placeOrder);
+        }
+
+        wrap.querySelectorAll('[data-remove]').forEach((btn) => btn.addEventListener('click', onRemove));
+        wrap.querySelectorAll('[data-q]').forEach((btn) => btn.addEventListener('click', onQty));
+      }
+
+      async function onRemove(e) {
+        const id = e.currentTarget.dataset.remove;
+        if (!id) return;
+        if (!confirm('Item verwijderen uit winkelmand?')) return;
+        try {
+          await NEB.del('/api/cart/' + id);
+          NEB.toast('Verwijderd');
+          await refreshData();
+          await NEB.paintCart();
+          render();
+        } catch (err) {
+          NEB.toast(err.message, 'error');
+        }
+      }
+
+      async function onQty(e) {
+        const qtyBtn = e.currentTarget;
+        const wrapEl = qtyBtn.closest('[data-qty]');
+        if (!wrapEl) return;
+        const id = wrapEl.dataset.qty;
+        const span = wrapEl.querySelector('span');
+        const cur = Number(span?.textContent) || 1;
+        const next = Math.max(1, Math.min(99, cur + Number(qtyBtn.dataset.q)));
+        if (next === cur) return;
+        try {
+          await NEB.put('/api/cart/' + id, { qty: next });
+          await refreshData();
+          await NEB.paintCart();
+          render();
+        } catch (err) {
+          NEB.toast(err.message, 'error');
         }
       }
 
       async function placeOrder() {
-        const customer = {
-          firstName: val('ck_firstName'), lastName: val('ck_lastName'), email: val('ck_email'),
-          company: val('ck_company'), vatNumber: val('ck_vat'),
-          address: val('ck_address'), postcode: val('ck_postcode'), city: val('ck_city'), phone: val('ck_phone')
-        };
-        const required = ['firstName','lastName','email','address','postcode','city'];
-        for (const k of required) {
-          if (!customer[k]) { NEB.toast('Vul alle adresvelden in', 'error'); document.getElementById('ck_' + k)?.focus(); return; }
-        }
+        if (!validateCustomer()) return;
         const btn = document.getElementById('checkoutBtn');
-        btn.disabled = true; const orig = btn.textContent; btn.textContent = 'Bezig...';
+        const orig = btn?.textContent || 'Bestelling plaatsen';
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = 'Bestelling plaatsen...';
+        }
         try {
-          const res = await NEB.post('/api/orders', { customer, saveAddress: document.getElementById('ck_save').checked });
+          const res = await NEB.post('/api/orders', { customer: checkoutState.customer, saveAddress: checkoutState.saveAddress });
           NEB.toast('Bestelling geplaatst', 'success');
           location.href = '/dashboard?order=' + res.orderId;
         } catch (err) {
-          btn.disabled = false; btn.textContent = orig;
+          if (btn) {
+            btn.disabled = false;
+            btn.textContent = orig;
+          }
           NEB.toast(err.message || 'Bestellen mislukt', 'error');
         }
       }
 
-      function val(id) { return (document.getElementById(id)?.value || '').trim(); }
-      function esc(s) { return String(s == null ? '' : s).replace(/"/g, '&quot;'); }
+      await refreshData();
+      render();
+
+      function esc(s) {
+        return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }
       function escapeHtml(s) {
         return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
       }

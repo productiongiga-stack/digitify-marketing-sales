@@ -29,6 +29,11 @@ const THEME_PRESETS = {
   BLUE: { accentColor: '#3b82f6', accentColor2: '#0ea5e9', headingFont: 'POPPINS', bodyFont: 'INTER', buttonStyle: 'ROUNDED', sectionTone: 'MUTED' },
   NEUTRAL: { accentColor: '#e5e7eb', accentColor2: '#a3a3a3', headingFont: 'SERIF', bodyFont: 'SYSTEM', buttonStyle: 'SHARP', sectionTone: 'FLAT' }
 };
+const THEME_PRESET_META = {
+  GREEN: { label: 'Green Atelier', note: 'Levendig, premium en conversion-gericht' },
+  BLUE: { label: 'Blue Studio', note: 'Strak, helder en trust-first' },
+  NEUTRAL: { label: 'Neutral Editorial', note: 'Rustig, chic en productgericht' }
+};
 
 let CURRENT_USER = null;
 let ORDER_STATE = { page: 1, limit: 20, q: '', status: '', invoiceStatus: '', archived: 'ACTIVE' };
@@ -3363,6 +3368,27 @@ function renderSettings(c) {
   const templateRows = `
     <div class="tmpl-tab-bar">${templateTabBar}</div>
     ${templatePanels}`;
+  const themePresetKey = String(theme.themePreset || 'CUSTOM').toUpperCase();
+  const presetCards = Object.entries(THEME_PRESET_META).map(([key, meta]) => {
+    const values = THEME_PRESETS[key] || {};
+    const active = themePresetKey === key;
+    return `
+      <button type="button" class="theme-preset-card${active ? ' active' : ''}" data-theme-preset-card="${key}">
+        <div class="theme-preset-swatches">
+          <span style="background:${escAttr(values.accentColor || '#ffffff')}"></span>
+          <span style="background:${escAttr(values.accentColor2 || '#bdbdbd')}"></span>
+        </div>
+        <div class="theme-preset-copy">
+          <strong>${escText(meta.label)}</strong>
+          <span>${escText(meta.note)}</span>
+        </div>
+        <div class="theme-preset-mini">
+          <span class="theme-preset-chip">${escText(values.headingFont || 'POPPINS')}</span>
+          <span class="theme-preset-demo-btn">${key === 'NEUTRAL' ? 'Editorial' : key === 'BLUE' ? 'Studio' : 'Atelier'}</span>
+        </div>
+      </button>
+    `;
+  }).join('');
 
   return `
     <div class="stab-panel active" data-stab="algemeen">
@@ -3428,6 +3454,9 @@ function renderSettings(c) {
     <div class="settings-section">
       <h3>Branding &amp; thema</h3>
       <p class="muted compact" style="margin:-.5rem 0 1rem">Kleuren, typografie en buttons worden op alle pagina's toegepast.</p>
+      <div class="theme-preset-grid">
+        ${presetCards}
+      </div>
       <div class="form-grid-2">
         <div class="field"><label>Logo symbool</label><input id="themeLogoMark" value="${escAttr(theme.logoMark || '✦')}" maxlength="2" placeholder="✦"></div>
         <div class="field"><label>Thema preset</label>
@@ -3596,6 +3625,7 @@ function renderSettings(c) {
     <div class="settings-section">
       <h3>SMTP server</h3>
       <p class="muted compact" style="margin:-.5rem 0 1rem">SMTP-instellingen worden gebruikt voor alle uitgaande e-mails. Omgevingsvariabelen (SMTP_HOST etc.) hebben voorrang.</p>
+      ${smtp.host ? '' : '<div class="theme-warning">SMTP is momenteel niet geconfigureerd. Testmails en ordermeldingen worden nu overgeslagen.</div>'}
       <div class="form-grid-2">
         <div class="field"><label>SMTP host</label><input id="smtpHost" value="${escAttr(smtp.host || '')}" placeholder="smtp.gmail.com"></div>
         <div class="field"><label>SMTP poort</label><input type="number" id="smtpPort" value="${escAttr(smtp.port || 587)}" placeholder="587"></div>
@@ -3813,6 +3843,17 @@ function bindSettings(cfg) {
       wrap.querySelector('#uploadFaviconFile')?.click();
       return;
     }
+    const presetCard = t.closest?.('[data-theme-preset-card]');
+    if (presetCard?.dataset?.themePresetCard) {
+      const preset = String(presetCard.dataset.themePresetCard || 'CUSTOM').toUpperCase();
+      if (!applyThemePresetToDraft(preset)) {
+        NEB.toast('Onbekende preset', 'error');
+        return;
+      }
+      rerender();
+      NEB.toast(`Thema preset ${preset} toegepast`, 'success');
+      return;
+    }
     if (t.id === 'applyThemePresetBtn') {
       const preset = String(wrap.querySelector('#themePreset')?.value || 'CUSTOM').toUpperCase();
       if (preset === 'CUSTOM') {
@@ -3858,9 +3899,14 @@ function bindSettings(cfg) {
         if (result) result.textContent = 'Config opslaan...';
         await NEB.put('/api/admin/config', draft);
         if (result) result.textContent = 'Testmail versturen...';
-        await NEB.post('/api/admin/email/test', { templateKey: 'orderPlaced', to });
-        if (result) result.textContent = 'Testmail verstuurd';
-        NEB.toast('SMTP testmail verstuurd', 'success');
+        const out = await NEB.post('/api/admin/email/test', { templateKey: 'orderPlaced', to });
+        if (out?.info?.skipped === 'smtp_not_configured') {
+          if (result) result.textContent = 'SMTP ontbreekt';
+          NEB.toast('SMTP is nog niet geconfigureerd', 'error');
+        } else {
+          if (result) result.textContent = 'Testmail verstuurd';
+          NEB.toast('SMTP testmail verstuurd', 'success');
+        }
       } catch (err) {
         if (result) result.textContent = 'Mislukt';
         NEB.toast(err.message || 'SMTP test mislukt', 'error');
@@ -3953,8 +3999,12 @@ function bindSettings(cfg) {
       try {
         if (btn) { btn.disabled = true; btn.textContent = 'Versturen...'; }
         await NEB.put('/api/admin/config', draft);
-        await NEB.post('/api/admin/email/test', { templateKey: testTemplate, to });
-        NEB.toast('Testmail verstuurd', 'success');
+        const out = await NEB.post('/api/admin/email/test', { templateKey: testTemplate, to });
+        if (out?.info?.skipped === 'smtp_not_configured') {
+          NEB.toast('SMTP is nog niet geconfigureerd', 'error');
+        } else {
+          NEB.toast('Testmail verstuurd', 'success');
+        }
       } catch (err) {
         NEB.toast(err.message || 'Testmail mislukt', 'error');
       } finally {
