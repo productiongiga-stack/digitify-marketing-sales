@@ -1299,16 +1299,42 @@ function _nebMain() {
         }
         schedulePreviewModalRefresh();
     }
+    function normalizeOffsetScale(offsetScale = 1) {
+        if (offsetScale && typeof offsetScale === 'object') {
+            return {
+                x: Number(offsetScale.x) || 1,
+                y: Number(offsetScale.y) || 1
+            };
+        }
+        const scalar = Number(offsetScale) || 1;
+        return { x: scalar, y: scalar };
+    }
+
     function getLayerLayout(layer, offsetScale = 1) {
         const pos = positionMap[layer.position] || positionMap.center;
         const scaleFactor = (layer.scale || 100) / 100;
         const adj = getSizeAdj();
         const topPct = pos.top + (adj.top || 0);
         const widthPct = Math.max(8, (pos.w + (adj.w || 0)) * scaleFactor);
-        const xPx = Math.round((layer.xOffset || 0) * offsetScale);
-        const yPx = Math.round((layer.vOffset || 0) * offsetScale);
+        const scale = normalizeOffsetScale(offsetScale);
+        const xPx = Math.round((layer.xOffset || 0) * scale.x);
+        const yPx = Math.round((layer.vOffset || 0) * scale.y);
         const transform = `translate(-50%,-50%) translateX(${xPx}px) translateY(${yPx}px)`;
         return { leftPct: pos.left, topPct, widthPct, xPx, yPx, transform };
+    }
+
+    function getLiveLayerMetrics(layer) {
+        const sourceRect = tshirt3d?.getBoundingClientRect();
+        const layerRect = layer?.canvas?.getBoundingClientRect();
+        if (!sourceRect || !layerRect || !sourceRect.width || !sourceRect.height) return null;
+        return {
+            left: layerRect.left - sourceRect.left,
+            top: layerRect.top - sourceRect.top,
+            width: layerRect.width,
+            height: layerRect.height,
+            sourceWidth: sourceRect.width,
+            sourceHeight: sourceRect.height
+        };
     }
 
     // ── Vertical fine-tuning ──
@@ -1456,10 +1482,6 @@ function _nebMain() {
         }
         if (!hasLayers) return;
 
-        const sourceRect = tshirt3d?.getBoundingClientRect();
-        const targetRect = productPreviewTshirt?.getBoundingClientRect();
-        const modalScale = (sourceRect?.width && targetRect?.width) ? (targetRect.width / sourceRect.width) : 1;
-
         state.layers.forEach((layer) => {
             if (!layer?.canvas) return;
             const source = layer.canvas;
@@ -1469,12 +1491,11 @@ function _nebMain() {
             clone.height = source.height || 1024;
             const ctx = clone.getContext('2d');
             if (ctx) ctx.drawImage(source, 0, 0);
-            const layout = getLayerLayout(layer, modalScale);
-            clone.style.left = layout.leftPct + '%';
-            clone.style.top = layout.topPct + '%';
-            clone.style.width = layout.widthPct + '%';
+            clone.style.left = source.style.left || '50%';
+            clone.style.top = source.style.top || '44%';
+            clone.style.width = source.style.width || '28%';
             clone.style.height = source.style.height || 'auto';
-            clone.style.transform = layout.transform;
+            clone.style.transform = source.style.transform || 'translate(-50%,-50%)';
             if (layer.id === state.activeLayerId) clone.dataset.active = 'true';
             productPreviewLayerStack.appendChild(clone);
         });
@@ -1495,7 +1516,18 @@ function _nebMain() {
             if (maskUrl) productPreviewTint.style.setProperty('--mockup-mask-url', maskUrl);
         }
         if (productPreviewTshirt && tshirt3d) {
-            productPreviewTshirt.style.transform = tshirt3d.style.transform || 'perspective(1000px) rotateX(0deg) rotateY(0deg)';
+            const sourceRect = tshirt3d.getBoundingClientRect();
+            const targetRect = productPreviewCanvas?.getBoundingClientRect();
+            const fitScale = (sourceRect.width && sourceRect.height && targetRect?.width && targetRect?.height)
+                ? Math.min((targetRect.width * 0.82) / sourceRect.width, (targetRect.height * 0.82) / sourceRect.height)
+                : 1;
+            const baseTransform = tshirt3d.style.transform && tshirt3d.style.transform !== 'none'
+                ? tshirt3d.style.transform
+                : 'perspective(1000px) rotateX(0deg) rotateY(0deg)';
+            productPreviewTshirt.style.width = Math.round(sourceRect.width) + 'px';
+            productPreviewTshirt.style.height = Math.round(sourceRect.height) + 'px';
+            productPreviewTshirt.style.transform = `${baseTransform} scale(${Number.isFinite(fitScale) ? fitScale : 1})`;
+            productPreviewTshirt.style.transformOrigin = 'center center';
         }
         refreshPreviewLayers();
     }
@@ -1593,24 +1625,45 @@ function _nebMain() {
 
         // Convert UI px offsets to natural image px offsets
         const rect = tshirt3d?.getBoundingClientRect();
-        const scalePx = rect && rect.width ? (baseW / rect.width) : 1;
+        const scalePx = rect && rect.width && rect.height
+            ? { x: baseW / rect.width, y: baseH / rect.height }
+            : 1;
 
         // Draw each design layer in the same order as the live preview
         for (const layer of (state.layers || [])) {
-            const layout = getLayerLayout(layer, scalePx);
-
-            const w = baseW * (layout.widthPct / 100);
-            const h = w; // square canvas for the design
-            const cx = baseW * (layout.leftPct / 100);
-            const cy = baseH * (layout.topPct / 100);
-
-            const x = (cx - w / 2) + layout.xPx;
-            const y = (cy - h / 2) + layout.yPx;
-
             // Use the already-rendered layer canvas (1024x1024)
             if (layer.canvas) {
+                const liveMetrics = getLiveLayerMetrics(layer);
+                if (liveMetrics) {
+                    ctx.drawImage(
+                        layer.canvas,
+                        liveMetrics.left * scalePx.x,
+                        liveMetrics.top * scalePx.y,
+                        liveMetrics.width * scalePx.x,
+                        liveMetrics.height * scalePx.y
+                    );
+                    continue;
+                }
+                const layout = getLayerLayout(layer, scalePx);
+                const w = baseW * (layout.widthPct / 100);
+                const sourceWidth = layer.canvas.width || 1;
+                const sourceHeight = layer.canvas.height || sourceWidth;
+                const h = w * (sourceHeight / Math.max(1, sourceWidth));
+                const cx = baseW * (layout.leftPct / 100);
+                const cy = baseH * (layout.topPct / 100);
+                const x = (cx - w / 2) + layout.xPx;
+                const y = (cy - h / 2) + layout.yPx;
                 ctx.drawImage(layer.canvas, x, y, w, h);
             } else if (layer.img) {
+                const layout = getLayerLayout(layer, scalePx);
+                const w = baseW * (layout.widthPct / 100);
+                const sourceWidth = layer.img.naturalWidth || layer.img.width || 1;
+                const sourceHeight = layer.img.naturalHeight || layer.img.height || sourceWidth;
+                const h = w * (sourceHeight / Math.max(1, sourceWidth));
+                const cx = baseW * (layout.leftPct / 100);
+                const cy = baseH * (layout.topPct / 100);
+                const x = (cx - w / 2) + layout.xPx;
+                const y = (cy - h / 2) + layout.yPx;
                 ctx.drawImage(layer.img, x, y, w, h);
             }
         }
@@ -1797,6 +1850,7 @@ async function placeOrder() {
             total: calcUnitPrice() * state.qty
         };
         const designs = (state.layers || []).map(l => ({
+            id: l.id,
             name: l.name, position: l.position, scale: l.scale,
             vOffset: l.vOffset, xOffset: l.xOffset || 0,
             note: l.note || ''
@@ -1805,13 +1859,14 @@ async function placeOrder() {
         const formData = new FormData();
         formData.append('product', JSON.stringify(product));
         formData.append('designs', JSON.stringify(designs));
-        formData.append('notes', '');
+        formData.append('notes', ($('#remarksInput')?.value || '').trim());
         if (previewDataUrl) {
             const previewBlob = dataUrlToBlob(previewDataUrl);
             if (previewBlob) formData.append('preview', previewBlob, 'preview.png');
         }
         (state.layers || []).forEach((l, idx) => {
             if (l.file) {
+                formData.append('designFileLayerIds', l.id);
                 formData.append('designFiles', l.file, l.file.name || `design-${idx + 1}.png`);
             }
         });

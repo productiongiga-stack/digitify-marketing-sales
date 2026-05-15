@@ -2783,10 +2783,22 @@ app.post('/api/cart', requireAuth, cartUpload.fields([
   const uploaded = normalizeUploadFilesForCart(req.files?.preview?.[0] || null, req.files?.designFiles, 20);
   const previewFile = uploaded.preview;
   const designFiles = uploaded.files;
+  const designFileLayerIdsRaw = req.body?.designFileLayerIds;
+  const designFileLayerIds = (Array.isArray(designFileLayerIdsRaw)
+    ? designFileLayerIdsRaw
+    : (designFileLayerIdsRaw == null ? [] : [designFileLayerIdsRaw]))
+    .map(v => String(v || '').trim())
+    .filter(Boolean);
+  const hasExplicitFileMapping = designFileLayerIds.length > 0;
+
+  if (hasExplicitFileMapping && designFileLayerIds.length !== designFiles.length) {
+    return res.status(400).json({ error: 'Aantal design-bestanden komt niet overeen met de layer-koppeling' });
+  }
 
   // Backward compatibility: if only files are sent, generate metadata automatically.
   if (!designs.length && designFiles.length) {
     designs = designFiles.map((f, idx) => ({
+      id: designFileLayerIds[idx] || `design-${idx + 1}`,
       name: f.originalname || `Design ${idx + 1}`,
       position: 'center',
       scale: 100,
@@ -2803,9 +2815,51 @@ app.post('/api/cart', requireAuth, cartUpload.fields([
   if (!designs.length) {
     return res.status(400).json({ error: 'Design metadata ontbreekt' });
   }
+  if (!hasExplicitFileMapping && designFiles.length && !hasLegacyDataUrls && designs.length !== designFiles.length) {
+    return res.status(400).json({ error: 'Aantal design-bestanden komt niet overeen met metadata' });
+  }
+
+  const seenDesignIds = new Set();
+  designs = designs.map((d, idx) => {
+    const id = String(d?.id || '').trim();
+    if (id) {
+      if (seenDesignIds.has(id)) {
+        const duplicate = new Error(`Dubbele design-id voor design ${idx + 1}`);
+        duplicate.status = 400;
+        throw duplicate;
+      }
+      seenDesignIds.add(id);
+    }
+    return { ...d, id };
+  });
+
+  const fileByLayerId = new Map();
+  if (hasExplicitFileMapping) {
+    designFileLayerIds.forEach((layerId, idx) => {
+      if (fileByLayerId.has(layerId)) {
+        const duplicate = new Error(`Dubbele bestandskoppeling voor layer ${layerId}`);
+        duplicate.status = 400;
+        throw duplicate;
+      }
+      fileByLayerId.set(layerId, designFiles[idx]);
+    });
+    for (let idx = 0; idx < designs.length; idx++) {
+      const designId = String(designs[idx]?.id || '').trim();
+      if (!designId) {
+        const missingId = new Error(`Layer-id ontbreekt voor design ${idx + 1}`);
+        missingId.status = 400;
+        throw missingId;
+      }
+      if (!fileByLayerId.has(designId) && !designs[idx]?.dataUrl) {
+        const missingFile = new Error(`Bestand ontbreekt voor design ${idx + 1}`);
+        missingFile.status = 400;
+        throw missingFile;
+      }
+    }
+  }
 
   const cfg = await getConfig();
-  const priced = computeItemPrice({
+  const priced = await computeItemPrice({
     ...product,
     designs,
     extraDesigns: Math.max(0, designs.length - 1)
@@ -2860,7 +2914,8 @@ app.post('/api/cart', requireAuth, cartUpload.fields([
 
   const storedDesignFiles = await mapWithConcurrency(designs, 3, async (d, idx) => {
     let filePath = null;
-    const file = designFiles[idx];
+    const designId = String(d?.id || '').trim();
+    const file = (designId && fileByLayerId.get(designId)) || designFiles[idx];
     if (file?.buffer?.length) {
       const optimized = await optimizeUploadedImage(file.buffer, file.mimetype || 'image/png', 'design');
       const ext = optimized?.ext || extFromMime(file.mimetype || 'image/png');
