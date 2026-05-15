@@ -3069,7 +3069,7 @@ app.post('/api/cart', requireAuth, cartUpload.fields([
       throw fileMissing;
     }
 
-    insertDesign.run(itemId, d.name || `Design ${idx + 1}`, d.position || 'center',
+    await insertDesign.run(itemId, d.name || `Design ${idx + 1}`, d.position || 'center',
       Number(d.scale) || 100, Number(d.vOffset) || 0, Number(d.xOffset) || 0, d.note || '', filePath);
   }
 

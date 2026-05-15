@@ -140,6 +140,13 @@ CREATE TABLE IF NOT EXISTS deposit_invoices (
   `);
 
   const columnAdds = [
+    ['cart_items', 'product_type', "TEXT NOT NULL DEFAULT 'tshirt'"],
+    ['cart_items', 'product_label', "TEXT NOT NULL DEFAULT 'T-shirt'"],
+    ['cart_items', 'product_mockup_path', 'TEXT'],
+    ['cart_items', 'product_price_multiplier', 'REAL NOT NULL DEFAULT 1'],
+
+    ['cart_item_designs', 'x_offset', 'REAL'],
+
     ['orders', 'deleted_at', 'TIMESTAMPTZ'],
     ['orders', 'deleted_by', 'INTEGER REFERENCES users(id)'],
     ['orders', 'delete_reason', 'TEXT'],
@@ -152,6 +159,8 @@ CREATE TABLE IF NOT EXISTS deposit_invoices (
     ['order_items', 'product_label', "TEXT NOT NULL DEFAULT 'T-shirt'"],
     ['order_items', 'product_mockup_path', 'TEXT'],
     ['order_items', 'product_price_multiplier', 'REAL NOT NULL DEFAULT 1'],
+
+    ['order_designs', 'x_offset', 'REAL'],
 
     ['order_status_history', 'changed_by_email', 'TEXT'],
 
