@@ -523,10 +523,12 @@ function formatAuditDetails(details) {
 
   setupTabs();
   setupOrdersSubTabs();
-  await loadOrders();
-  NEB.paintAdminBadges();
+  loadOrders().catch((err) => {
+    renderOrdersError(err);
+    renderInvoiceOverviewError(err);
+  });
+  NEB.paintAdminBadges().catch(() => {});
   setInterval(() => NEB.paintAdminBadges(), 30000);
-  // Load notification badge count in background for all staff
   if (['ADMIN', 'OWNER'].includes(CURRENT_USER.role)) {
     NEB.get('/api/admin/notifications').then(updateNotifBadge).catch(() => {});
   }
@@ -680,8 +682,61 @@ function applySettingsSubTab(stab) {
   });
 }
 
+function renderOrdersLoading() {
+  const stats = document.getElementById('orderStats');
+  const wrap = document.getElementById('ordersWrap');
+  const pager = document.getElementById('pager');
+  if (stats) {
+    stats.innerHTML = `
+      <div class="stat"><div class="stat-label">Totale orders</div><div class="stat-value">…</div></div>
+      <div class="stat"><div class="stat-label">Open</div><div class="stat-value">…</div></div>
+      <div class="stat"><div class="stat-label">Verzonden + bezorgd</div><div class="stat-value">…</div></div>
+      <div class="stat"><div class="stat-label">Bruto omzet</div><div class="stat-value">…</div></div>
+    `;
+  }
+  if (wrap) {
+    wrap.innerHTML = `<div class="card empty-state"><h3>Bestellingen laden…</h3><p>We halen de laatste orders op.</p></div>`;
+  }
+  if (pager) pager.innerHTML = '';
+}
+
+function renderOrdersError(err) {
+  const stats = document.getElementById('orderStats');
+  const wrap = document.getElementById('ordersWrap');
+  const pager = document.getElementById('pager');
+  if (stats) stats.innerHTML = '';
+  if (wrap) {
+    wrap.innerHTML = `<div class="card empty-state"><h3>Bestellingen konden niet laden</h3><p>${escText(err?.message || 'Onbekende fout')}</p></div>`;
+  }
+  if (pager) pager.innerHTML = '';
+}
+
+function renderInvoiceOverviewLoading() {
+  const mount = document.getElementById('invoiceOverview');
+  if (!mount) return;
+  mount.innerHTML = `
+    <div class="card" style="padding:1rem 1.1rem">
+      <h3 style="margin:0 0 .4rem">Facturen laden…</h3>
+      <p class="muted compact" style="margin:0">We halen de facturen en openstaande reminders op.</p>
+    </div>`;
+}
+
+function renderInvoiceOverviewError(err) {
+  const mount = document.getElementById('invoiceOverview');
+  const invBadge = document.getElementById('invoiceBadge');
+  if (invBadge) invBadge.hidden = true;
+  if (!mount) return;
+  mount.innerHTML = `
+    <div class="card" style="padding:1rem 1.1rem">
+      <h3 style="margin:0 0 .4rem">Facturen konden niet laden</h3>
+      <p class="muted compact" style="margin:0">${escText(err?.message || 'Onbekende fout')}</p>
+    </div>`;
+}
+
 // ── Orders ────────────────────────────────────────────────────────────────
 async function loadOrders() {
+  renderOrdersLoading();
+  renderInvoiceOverviewLoading();
   const { page, limit, q, status, invoiceStatus, archived } = ORDER_STATE;
   const params = new URLSearchParams({ page, limit, q, status, invoiceStatus, archived });
   const invParams = new URLSearchParams({
@@ -689,15 +744,22 @@ async function loadOrders() {
     sort: INVOICE_OVERVIEW_STATE.sort,
     limit: INVOICE_OVERVIEW_STATE.limit
   });
-  const [data, invoiceData] = await Promise.all([
-    NEB.get('/api/admin/orders?' + params.toString()),
-    NEB.get('/api/admin/invoices?' + invParams.toString())
-  ]);
+  const ordersPromise = NEB.get('/api/admin/orders?' + params.toString());
+  const invoicesPromise = NEB.get('/api/admin/invoices?' + invParams.toString());
   const csvLink = document.querySelector('#ordersToolbar a[href^="/api/admin/orders.csv"]');
   if (csvLink) {
     const csvParams = new URLSearchParams();
     if (archived) csvParams.set('archived', archived);
     csvLink.href = '/api/admin/orders.csv' + (csvParams.toString() ? `?${csvParams.toString()}` : '');
+  }
+  invoicesPromise.then(renderInvoiceOverview).catch(renderInvoiceOverviewError);
+
+  let data;
+  try {
+    data = await ordersPromise;
+  } catch (err) {
+    renderOrdersError(err);
+    return;
   }
 
   // Stats
@@ -712,7 +774,6 @@ async function loadOrders() {
     <div class="stat"><div class="stat-label">Verzonden + bezorgd</div><div class="stat-value">${s.done_count || 0}</div></div>
     <div class="stat"><div class="stat-label">Bruto omzet</div><div class="stat-value">${NEB.fmtEUR(s.revenue || 0)}</div></div>
   `;
-  renderInvoiceOverview(invoiceData);
 
   const wrap = document.getElementById('ordersWrap');
   if (!data.orders.length) {

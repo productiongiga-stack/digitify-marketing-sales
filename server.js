@@ -920,6 +920,34 @@ async function backfillMissingInvoices(config, limit = 300) {
   return rows.length;
 }
 
+const INVOICE_MAINTENANCE_COOLDOWN_MS = 5 * 60 * 1000;
+let invoiceMaintenanceState = {
+  running: false,
+  lastRunAt: 0,
+  lastPromise: null
+};
+
+function scheduleInvoiceMaintenance(force = false) {
+  const now = Date.now();
+  if (!force && invoiceMaintenanceState.running) return invoiceMaintenanceState.lastPromise;
+  if (!force && invoiceMaintenanceState.lastRunAt && (now - invoiceMaintenanceState.lastRunAt) < INVOICE_MAINTENANCE_COOLDOWN_MS) {
+    return invoiceMaintenanceState.lastPromise;
+  }
+  invoiceMaintenanceState.running = true;
+  invoiceMaintenanceState.lastPromise = (async () => {
+    try {
+      const cfg = await getConfig();
+      const backfilled = await backfillMissingInvoices(cfg, 120);
+      const reminders = await processInvoiceRemindersSafe(false);
+      invoiceMaintenanceState.lastRunAt = Date.now();
+      return { backfilled, reminders };
+    } finally {
+      invoiceMaintenanceState.running = false;
+    }
+  })();
+  return invoiceMaintenanceState.lastPromise;
+}
+
 async function finalizeInvoiceForOrder(orderId, config) {
   if (!config) config = await getConfig();
   const id = Number(orderId);
@@ -3213,7 +3241,7 @@ app.get('/api/orders/mine', requireAuth, async (req, res) => {
                            WHERE user_id = ? AND deleted_at IS NULL ORDER BY id DESC`).all(req.user.id);
   const orderIds = rows.map(r => r.id);
   if (orderIds.length) {
-    await backfillMissingInvoices(await getConfig(), 400);
+    scheduleInvoiceMaintenance(false)?.catch(() => {});
   }
   const placeholders = orderIds.map(() => '?').join(',');
   const invoices = orderIds.length
@@ -3312,8 +3340,7 @@ app.put('/api/orders/:id/cancel', requireAuth, async (req, res) => {
 
 // ── Staff ─────────────────────────────────────────────────────────────────
 app.get('/api/admin/orders', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
-  processInvoiceRemindersSafe(false).catch(() => {});
-  await backfillMissingInvoices(await getConfig(), 400);
+  scheduleInvoiceMaintenance(false)?.catch(() => {});
   const page = Math.max(1, Number(req.query.page) || 1);
   const limit = Math.min(100, Math.max(5, Number(req.query.limit) || 20));
   const offset = (page - 1) * limit;
@@ -3414,9 +3441,7 @@ function invoiceSortOrderSql(raw) {
 }
 
 app.get('/api/admin/invoices', requireAuth, requireRole('ADMIN', 'OWNER'), async (req, res) => {
-  const cfg = await getConfig();
-  await backfillMissingInvoices(cfg, 400);
-  await processInvoiceRemindersSafe(false);
+  scheduleInvoiceMaintenance(false)?.catch(() => {});
   const page = Math.max(1, Number(req.query.page) || 1);
   const limit = Math.min(100, Math.max(10, Number(req.query.limit) || 20));
   const offset = (page - 1) * limit;

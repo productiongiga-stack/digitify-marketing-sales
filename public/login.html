@@ -41,16 +41,7 @@
           <span>Onthoud mij (30 dagen)</span>
         </label>
         <p class="field-check-hint">Uitgevinkt = alleen ingelogd tot je browser sluit.</p>
-        <div id="otpStep" class="form-stack" hidden>
-          <div class="field">
-            <label for="otpCode">2FA code</label>
-            <input type="text" id="otpCode" inputmode="numeric" autocomplete="one-time-code" placeholder="6 cijfers" maxlength="6">
-          </div>
-          <p class="muted compact" style="margin-top:-.4rem">Open je authenticator app en vul de 6-cijferige code in.</p>
-          <div style="display:flex;justify-content:flex-end">
-            <button type="button" class="btn btn-ghost btn-sm" id="otpCancelBtn">Opnieuw starten</button>
-          </div>
-        </div>
+        <div id="otpStepMount"></div>
         <button type="submit" class="btn btn-primary btn-block" id="submitBtn">Inloggen</button>
       </form>
 
@@ -68,25 +59,38 @@
     const form = document.getElementById('loginForm');
     const alertSlot = document.getElementById('alertSlot');
     const btn = document.getElementById('submitBtn');
-    const otpStep = document.getElementById('otpStep');
-    const otpCode = document.getElementById('otpCode');
-    const otpCancelBtn = document.getElementById('otpCancelBtn');
+    const otpStepMount = document.getElementById('otpStepMount');
     let needsTwoFactor = false;
+    let otpCode = null;
+
+    function renderTwoFactorStep() {
+      otpStepMount.innerHTML = `
+        <div id="otpStep" class="form-stack">
+          <div class="field">
+            <label for="otpCode">2FA code</label>
+            <input type="text" id="otpCode" inputmode="numeric" autocomplete="one-time-code" placeholder="6 cijfers" maxlength="6">
+          </div>
+          <p class="muted compact" style="margin-top:-.4rem">Open je authenticator app en vul de 6-cijferige code in.</p>
+          <div style="display:flex;justify-content:flex-end">
+            <button type="button" class="btn btn-ghost btn-sm" id="otpCancelBtn">Opnieuw starten</button>
+          </div>
+        </div>`;
+      otpCode = document.getElementById('otpCode');
+      document.getElementById('otpCancelBtn')?.addEventListener('click', () => {
+        resetTwoFactorStep();
+        alertSlot.innerHTML = '';
+      });
+    }
 
     function resetTwoFactorStep() {
       needsTwoFactor = false;
-      otpStep.hidden = true;
-      otpCode.value = '';
+      otpStepMount.innerHTML = '';
+      otpCode = null;
       form.email.disabled = false;
       form.password.disabled = false;
       form.remember.disabled = false;
       btn.textContent = 'Inloggen';
     }
-
-    otpCancelBtn.addEventListener('click', () => {
-      resetTwoFactorStep();
-      alertSlot.innerHTML = '';
-    });
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -96,7 +100,7 @@
         let data;
         if (needsTwoFactor) {
           data = await NEB.post('/api/auth/login/2fa', {
-            code: otpCode.value.trim()
+            code: (otpCode?.value || '').trim()
           });
         } else {
           data = await NEB.post('/api/auth/login', {
@@ -108,13 +112,13 @@
 
         if (data.requires2fa) {
           needsTwoFactor = true;
-          otpStep.hidden = false;
+          if (!otpCode) renderTwoFactorStep();
           form.email.disabled = true;
           form.password.disabled = true;
           form.remember.disabled = true;
           btn.textContent = 'Verifieer 2FA';
           btn.disabled = false;
-          otpCode.focus();
+          otpCode?.focus();
           return;
         }
 

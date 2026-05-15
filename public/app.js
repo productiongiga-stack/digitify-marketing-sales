@@ -192,7 +192,7 @@ const NEB = (() => {
     async paintNav(opts = {}) {
       const slot = document.querySelector('[data-nav-user]');
       if (!slot) return;
-      const user = await this.me().catch(() => null);
+      const user = window.NEB_USER || await this.me().catch(() => null);
       if (!user) {
         slot.innerHTML = `
           <a class="nav-link-cta" href="/login">Inloggen</a>
